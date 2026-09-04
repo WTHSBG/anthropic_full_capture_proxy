@@ -34,8 +34,8 @@ pip install -r requirements.txt
 python proxy.py \
   --listen-host 0.0.0.0 \
   --listen-port 30303 \
-  --upstream-url http://36.138.156.38:35991 \
-  --log-dir ./capture_logs/run_20260806_1 \
+  --upstream-url https://llmapi.datatang.com \
+  --log-dir /data/ztr/a_log/830test/capture_logs \
   --timeout-seconds 300
 ```
 
