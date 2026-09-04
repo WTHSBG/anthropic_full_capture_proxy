@@ -2,7 +2,7 @@
 
 [上一步：运行 Harbor](README_02_运行_Harbor.md) · [返回总览](README.md) · [下一步：导出 ShareGPT](README_04_导出_ShareGPT.md)
 
-等单个 task 或整个 Harbor run 完成并保存 Claude Code session 后，根据输入目录布局选择下面三个脚本之一。输出目录必须不存在或为空，防止旧轮次残留导致数据混合。
+等单个 task 或整个 Harbor run 完成并保存 Claude Code session 后，根据输入目录布局选择下面四个脚本之一。输出目录必须不存在或为空，防止旧轮次残留导致数据混合。
 
 ## 选择整理脚本
 
@@ -11,6 +11,7 @@
 | 标准 Harbor run、`tasks/`、单个 task 或 session JSONL | `finalize.py` |
 | 无 `tasks/` 中间层的 Harbor jobs 目录 | `finalize-harbor.py` |
 | `node/worker` 目录 | `finalize-node.py` |
+| 单个 `proc_n/<group>/<task_id>` 目录，每个任务内有 `result.json` | `finalize-proc-split.py` |
 
 ## 方案 A：标准 Harbor 目录
 
@@ -120,6 +121,43 @@ python finalize-node.py \
 例如任务目录 `arvo_10013-b4800b5cb2eb4314bff374befc95bd55` 对应 result 日志 `arvo_10013_b4800b5cb2eb4314bff374befc95bd55.log`。脚本与 `shili/print_result.py` 一样，从 result 文件名最后一个下划线处分隔并用连字符还原任务目录名。
 
 只转换正确轨迹时增加 `--only-successful`。正误判定严格使用 `print_result.py` 的状态码逻辑：忽略 `vul_exit_code == 0` 的记录后取最后一次提交；漏洞版退出码不在 `{0, 71, 300}` 且修复版退出码为 `0` 时才是 `correct`。result 缺失、状态码缺失及其他分类都不会作为成功轨迹输出。
+
+## 方案 D：proc_n 分组任务目录
+
+适用于输入路径直接指向单个 `proc_n`，任务先按 `kernel`、`user` 等 group 分组，每个任务目录内分别保存 session 和判定结果：
+
+```text
+<proc_n>/
+├── <group>/
+│   └── <task_id>/
+│       ├── logs/
+│       │   └── projects/**/*.jsonl
+│       └── result.json
+└── run.log
+```
+
+运行：
+
+```bash
+python finalize-proc-split.py \
+  --capture-dir ./capture_logs/run_20260821 \
+  --proc-dir /path/to/run/proc_0 \
+  --output-dir ./dataset_output/proc_0
+```
+
+`--proc-dir` 必须是最后一级的单个 `proc_n`，不能传它们共同的上级目录。为了兼容其他整理脚本的调用方式，也可以用 `--harbor-run-dir` 作为 `--proc-dir` 的别名。
+
+脚本只处理完整任务目录。完整任务必须同时满足：
+
+- `logs/projects/` 下至少存在一个 `*.jsonl` session 文件
+- `result.json` 是合法 JSON，且包含非空的 `checks` 数组
+- 每个 `checks[*].score` 都是数值 `1.0` 或 `0.0`
+
+所有 check 的 `score` 都为 `1.0` 时，任务输出到 `successful/tasks/`；任一 check 的 `score` 为 `0.0` 时，任务输出到 `failed/tasks/`。缺少 session、缺少 `result.json`、JSON 损坏或 score 非法的未完成任务会被跳过，不会混入 `failed/tasks/`。
+
+最终输出的 task ID 使用 `<task_id>` 目录名，例如 `kernel_kernelctf_CVE-2023-3776_lts`。`result.json.task_id` 仅是结果元数据，示例值 `kernel:kernelctf/CVE-2023-3776_lts` 含路径分隔符或平台非法字符，因此不用于生成输出目录。
+
+如果只需要成功轨迹，增加 `--only-successful`。无论某一类是否有轨迹，脚本都会创建稳定的 `successful/tasks/` 和 `failed/tasks/` 目录。跳过数量、跳过原因、评分分类数量及实际导出的成功/失败任务数量会写入 `finalization_report.json`。
 
 ## 输出结构
 
