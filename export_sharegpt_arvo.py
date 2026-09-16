@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""把 finalize.py 生成的数据集导出为 shili/arvo_50305.json 风格。
+"""恢复 finalize 响应并导出为 shili/arvo_50305.json 风格。
 
 每条记录固定包含 ``id``、``messages`` 和 ``tools``。工具调用和工具定义同时
 保留样例中的标准 ``function`` 层级与扁平兼容别名：
@@ -14,6 +14,9 @@ from __future__ import annotations
 同一个 agent 的相邻 round 只有在语义上下文连续时才合并。比较时会忽略每轮都会
 变化但不改变对话语义的 billing cch、cache_control 和 thinking signature，也会
 统一字符串与单个 text block 两种等价表示。工具只新增且旧定义不变时仍视为连续。
+
+round 加载复用 ``export_sharegpt_recovered.py`` 的事实证据恢复策略：完整重试可以
+替代失败请求，后续请求历史可以修正客户端实际接受的 assistant content。
 """
 
 import argparse
@@ -25,6 +28,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from capture_core import write_json
+from export_sharegpt import IncompleteResponseError as RecoveryIncompleteResponseError
+from export_sharegpt_recovered import load_agent_rounds_with_recovery
 
 
 ROUND_DIRECTORY_PATTERN = re.compile(r"^round_(\d+)$")
@@ -736,6 +741,7 @@ def export_sharegpt(
     file_count = 0
     split_count = 0
     errors: list[dict[str, Any]] = []
+    recoveries: list[dict[str, Any]] = []
 
     for task_dir in sorted(path for path in tasks_root.iterdir() if path.is_dir()):
         agent_dirs = discover_agent_dirs(task_dir)
@@ -748,8 +754,8 @@ def export_sharegpt(
         for agent_dir in agent_dirs:
             agent_count += 1
             try:
-                rounds = load_agent_rounds(agent_dir)
-            except IncompleteResponseError as exc:
+                rounds, agent_recoveries = load_agent_rounds_with_recovery(agent_dir)
+            except RecoveryIncompleteResponseError as exc:
                 errors.append(
                     {
                         "task": task_dir.name,
@@ -760,6 +766,11 @@ def export_sharegpt(
                     }
                 )
                 continue
+
+            for recovery in agent_recoveries:
+                recoveries.append(
+                    {"task": task_dir.name, "agent": agent_dir.name, **recovery}
+                )
             round_count += len(rounds)
             segments = split_rounds_by_context(rounds)
             split_count += max(0, len(segments) - 1)
@@ -777,9 +788,17 @@ def export_sharegpt(
                 file_count += 1
 
     error_report_path = output_dir / "export_errors.json"
+    recovery_report_path = output_dir / "recovery_report.json"
     write_json(
         error_report_path,
         {"error_count": len(errors), "errors": errors},
+    )
+    write_json(
+        recovery_report_path,
+        {
+            "recovered_round_count": len(recoveries),
+            "recoveries": recoveries,
+        },
     )
 
     return {
@@ -792,8 +811,10 @@ def export_sharegpt(
         "rounds": round_count,
         "sharegpt_files": file_count,
         "context_splits": split_count,
+        "recovered_rounds": len(recoveries),
         "skipped_agents": len(errors),
         "error_report": str(error_report_path.resolve()),
+        "recovery_report": str(recovery_report_path.resolve()),
         "format": "arvo-50305-hybrid-tool-calling",
     }
 
@@ -801,7 +822,7 @@ def export_sharegpt(
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "把 finalize 输出的 task/agent/round 数据集转换为 "
+            "恢复 finalize 响应并把 task/agent/round 数据集转换为 "
             "shili/arvo_50305.json 风格"
         )
     )

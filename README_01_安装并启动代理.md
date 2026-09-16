@@ -57,7 +57,7 @@ python proxy.py
 ## 3. 健康检查
 
 ```bash
-curl http://10.0.0.1:30303/healthz
+curl http://0.0.0.0:30303/healthz
 ```
 
 ## 4. 配置 Harbor / Claude Code

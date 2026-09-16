@@ -64,6 +64,25 @@ def parse_json_object(raw_body: bytes) -> Optional[dict[str, Any]]:
     return value if isinstance(value, dict) else None
 
 
+def is_messages_request_path(method: Any, path: Any) -> bool:
+    """识别 Anthropic Messages 资源路径，包括反向代理添加的路径前缀。
+
+    Anthropic 的资源路径是 ``/v1/messages``，但部署时 ``ANTHROPIC_BASE_URL``
+    可能带有 ``/anthropic`` 一类网关前缀，此时代理实际收到的路径会变成
+    ``/anthropic/v1/messages``。这里只扩展资源路径前缀，不会把
+    ``/v1/messages/count_tokens`` 或名称相近的端点误判成 Messages 请求。
+    """
+
+    if not isinstance(method, str) or method.upper() != "POST":
+        return False
+    if not isinstance(path, str) or not path:
+        return False
+    normalized_path = "/" + path.strip("/")
+    return normalized_path == "/v1/messages" or normalized_path.endswith(
+        "/v1/messages"
+    )
+
+
 def body_representation(raw_body: bytes) -> dict[str, Any]:
     """在最终数据集中保留可解析内容，同时保留原始字节的可逆表示。"""
     parsed: Any = None
@@ -436,7 +455,7 @@ class RequestCapture:
             "body_sha256": sha256_bytes(raw_body),
             "body_json": request_json,
             "client": {"host": client_host, "port": client_port},
-            "is_messages_request": method.upper() == "POST" and path.rstrip("/") == "/v1/messages",
+            "is_messages_request": is_messages_request_path(method, path),
         }
         write_json(self.paths.inflight_dir / "request.json", self.request_record)
         write_json(

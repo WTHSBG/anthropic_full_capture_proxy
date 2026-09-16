@@ -25,6 +25,18 @@ python export_sharegpt_recovered.py \
   --reasoning-mode separate
 ```
 
+默认会保留所有历史 `assistant` 消息的 role。如果训练时只希望对压缩子智能体的
+最后一条 assistant 计算 loss，可增加：
+
+```bash
+--mask-compact-assistant-history
+```
+
+开启后，正常 `subagent_acompact-*` 和缺失 JSONL 后恢复出的
+`subagent_acompact-recovered-*` 都会把每个导出 ShareGPT 样本中最后一条
+`assistant` 之前的所有 `assistant` role 改为 `masked_assistant`。主智能体和
+其他子智能体不受影响。
+
 恢复版复用严格导出器的 ShareGPT 格式、上下文切分、reasoning 模式和工具调用校验，并额外生成 `recovery_report.json`。该报告逐条记录 task、agent、被处理的 round、恢复动作以及作为证据的下一 round；无法安全恢复的不完整响应仍按严格导出器的方式写入 `export_errors.json`，其他结构错误仍会直接终止导出。
 
 ## 恢复版的证据和边界

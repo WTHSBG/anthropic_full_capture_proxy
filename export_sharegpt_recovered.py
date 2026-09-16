@@ -372,11 +372,32 @@ def load_agent_rounds_with_recovery(
     return rounds, recoveries
 
 
+def is_compact_agent_dir(agent_dir: Path) -> bool:
+    """判断 finalize agent 目录是否属于正常或恢复出的自动压缩子 agent。"""
+
+    return agent_dir.name.startswith("subagent_acompact-")
+
+
+def mask_assistant_history(record: dict[str, Any]) -> int:
+    """将最后一条之外的 assistant 消息标记为不参与 loss。"""
+
+    messages = base.require_list(record.get("messages"), "ShareGPT record.messages")
+    assistant_indexes = [
+        index
+        for index, message in enumerate(messages)
+        if isinstance(message, dict) and message.get("role") == "assistant"
+    ]
+    for index in assistant_indexes[:-1]:
+        messages[index]["role"] = "masked_assistant"
+    return max(0, len(assistant_indexes) - 1)
+
+
 def export_sharegpt_recovered(
     input_dir: Path,
     output_dir: Path,
     reasoning_mode: str,
     standard_structure: bool = True,
+    mask_compact_assistant_history: bool = False,
 ) -> dict[str, Any]:
     """执行兼容原格式的导出，并额外生成 recovery_report.json。"""
 
@@ -393,6 +414,7 @@ def export_sharegpt_recovered(
     round_count = 0
     file_count = 0
     split_count = 0
+    masked_assistant_count = 0
     errors: list[dict[str, Any]] = []
     recoveries: list[dict[str, Any]] = []
 
@@ -436,6 +458,8 @@ def export_sharegpt_recovered(
                     reasoning_mode,
                     standard_structure,
                 )
+                if mask_compact_assistant_history and is_compact_agent_dir(agent_dir):
+                    masked_assistant_count += mask_assistant_history(record)
                 write_json(task_output / f"{file_stem}.json", record, compact=True)
                 file_count += 1
 
@@ -458,6 +482,8 @@ def export_sharegpt_recovered(
         "output_dir": str(output_dir.resolve()),
         "reasoning_mode": reasoning_mode,
         "standard_structure": standard_structure,
+        "mask_compact_assistant_history": mask_compact_assistant_history,
+        "masked_assistant_messages": masked_assistant_count,
         "tasks": task_count,
         "agents": agent_count,
         "rounds": round_count,
@@ -514,6 +540,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="关闭标准结构，只生成示例扁平格式",
     )
     parser.set_defaults(standard_structure=True)
+    parser.add_argument(
+        "--mask-compact-assistant-history",
+        action="store_true",
+        help=(
+            "仅对正常及恢复出的 acompact 子 agent，将最终 ShareGPT 消息中最后一条 "
+            "assistant 之前的 assistant role 改为 masked_assistant"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -524,6 +558,7 @@ def main() -> None:
         output_dir=args.output_dir,
         reasoning_mode=args.reasoning_mode,
         standard_structure=args.standard_structure,
+        mask_compact_assistant_history=args.mask_compact_assistant_history,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

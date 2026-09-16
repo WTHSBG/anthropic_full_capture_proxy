@@ -59,6 +59,8 @@ python finalize.py \
 
 扫描 session 时，只索引合法 JSON object 中 `type == "assistant"`、`message` 为 object 且 `message.id` 为非空字符串的行。主/子 agent 由文件位置、`agentId`/`agent_id` 和 `isSidechain`/`is_sidechain` 联合判断。子 agent ID 优先取记录内的 `agentId`，缺失时从 `subagents/agent-<id>.jsonl` 文件名提取。
 
+如果 Claude Code 自动压缩时没有生成 `agent-acompact-*.jsonl`，finalizer 会用 HTTP compact 请求、session header、主 session 的 `compact_boundary`、时间和完整摘要正文做严格的一对一恢复。成功恢复的轨迹输出到 `subagent_acompact-recovered-<boundary_uuid>/`；源 session 不会被改写。证据不完整或不唯一时仍留在 `unmatched/`，详情见[采集与关联机制](README_05_采集与关联机制.md)。
+
 ## 方案 B：Harbor jobs 目录
 
 适用于没有 `tasks/` 中间层的布局：

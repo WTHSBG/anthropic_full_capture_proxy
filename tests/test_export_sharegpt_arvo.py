@@ -5,12 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from capture_core import write_json
 import export_sharegpt_arvo
+from capture_core import write_json
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SAMPLE_PATH = PROJECT_ROOT / "shili" / "arvo_50305.json"
 TEST_TMP_ROOT = PROJECT_ROOT / ".test_tmp"
 TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -101,30 +100,30 @@ class ArvoShareGPTExporterTests(unittest.TestCase):
             )
             output_text = output_path.read_text(encoding="utf-8")
             generated = json.loads(output_text)
-            sample = json.loads(SAMPLE_PATH.read_text(encoding="utf-8"))
 
-            sample_call = next(
-                message for message in sample["messages"] if message.get("tool_calls")
-            )["tool_calls"][0]
             generated_call = next(
                 message
                 for message in generated["messages"]
                 if message.get("tool_calls")
             )["tool_calls"][0]
-            sample_tool_message = next(
-                message for message in sample["messages"] if message["role"] == "tool"
-            )
             generated_tool_message = next(
                 message
                 for message in generated["messages"]
                 if message["role"] == "tool"
             )
 
-            self.assertEqual(list(generated), list(sample))
-            self.assertEqual(list(generated_call), list(sample_call))
-            self.assertEqual(list(generated["tools"][0]), list(sample["tools"][0]))
+            self.assertEqual(list(generated), ["id", "messages", "tools"])
             self.assertEqual(
-                list(generated_tool_message), list(sample_tool_message)
+                list(generated_call),
+                ["id", "type", "name", "arguments", "function"],
+            )
+            self.assertEqual(
+                list(generated["tools"][0]),
+                ["type", "name", "description", "parameters", "function"],
+            )
+            self.assertEqual(
+                list(generated_tool_message),
+                ["role", "name", "tool_call_id", "content", "is_error"],
             )
             self.assertTrue(output_text.startswith('{\n  "id":'))
             self.assertGreater(len(output_text.splitlines()), 1)
@@ -132,6 +131,100 @@ class ArvoShareGPTExporterTests(unittest.TestCase):
             self.assertTrue(report["standard_structure"])
             self.assertEqual(
                 report["format"], "arvo-50305-hybrid-tool-calling"
+            )
+
+    def test_export_recovers_response_from_following_request_history(self):
+        with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as temporary:
+            root = Path(temporary)
+            input_dir = root / "dataset"
+            output_dir = root / "sharegpt"
+            agent_dir = input_dir / "tasks/task_a/main_agent"
+            first_round = agent_dir / "round_000001"
+            second_round = agent_dir / "round_000002"
+
+            common_request = {
+                "model": "test-model",
+                "system": "system prompt",
+                "tools": [],
+            }
+            canonical_content = [{"type": "text", "text": "canonical answer"}]
+            write_json(
+                first_round / "request.json",
+                {
+                    "body": {
+                        "json": {
+                            **common_request,
+                            "messages": [{"role": "user", "content": "start"}],
+                        }
+                    }
+                },
+            )
+            write_json(
+                first_round / "response.json",
+                {
+                    "message": {
+                        "content": [{"type": "text", "text": "bad aggregation"}],
+                        "stop_reason": "end_turn",
+                    },
+                    "state": {"state": "complete"},
+                    "transport": {"aggregation_complete": True},
+                },
+            )
+            write_json(
+                second_round / "request.json",
+                {
+                    "body": {
+                        "json": {
+                            **common_request,
+                            "messages": [
+                                {"role": "user", "content": "start"},
+                                {
+                                    "role": "assistant",
+                                    "content": canonical_content,
+                                },
+                                {"role": "user", "content": "continue"},
+                            ],
+                        }
+                    }
+                },
+            )
+            write_json(
+                second_round / "response.json",
+                {
+                    "message": {
+                        "content": [{"type": "text", "text": "done"}],
+                        "stop_reason": "end_turn",
+                    },
+                    "state": {"state": "complete"},
+                    "transport": {"aggregation_complete": True},
+                },
+            )
+
+            report = export_sharegpt_arvo.export_sharegpt(input_dir, output_dir)
+            generated = json.loads(
+                (output_dir / "task_a/main_agent_1.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            recovery_report = json.loads(
+                (output_dir / "recovery_report.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(report["sharegpt_files"], 1)
+            self.assertEqual(report["context_splits"], 0)
+            self.assertEqual(report["recovered_rounds"], 1)
+            self.assertEqual(
+                report["recovery_report"],
+                str((output_dir / "recovery_report.json").resolve()),
+            )
+            self.assertEqual(recovery_report["recovered_round_count"], 1)
+            self.assertEqual(
+                recovery_report["recoveries"][0]["action"],
+                "replace_aggregation_from_following_request",
+            )
+            self.assertEqual(
+                [message["content"] for message in generated["messages"]],
+                ["system prompt", "start", "canonical answer", "continue", "done"],
             )
 
 

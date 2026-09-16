@@ -7,11 +7,14 @@ from __future__ import annotations
 1. ``capture_root``：proxy.py 的 ``--log-dir``，或该目录下面的 ``raw`` 目录；
 2. ``harbor_root``：Harbor run 根目录、tasks 目录、单个 task 目录，或一个 session JSONL。
 
-关联时不使用请求时间、客户端 IP、prompt hash 等模糊信息。唯一的主要关联键是：
+关联时不使用客户端 IP、相邻请求时间或普通 prompt hash 等模糊信息。主要关联键是：
 
     capture 的 response.json.message_id == session 中 assistant.message.id
 
-这样即使多个 Claude Code/agent 并发请求，也不会靠时间邻近关系误配。
+这样即使多个 Claude Code/agent 并发请求，也不会靠时间邻近关系误配。唯一的
+补充路径用于 Claude Code 未写出 ``agent-acompact-*.jsonl`` 的自动压缩响应：只有
+Messages 路径、session header、专用 compact prompt、compact_boundary、紧邻时间及
+响应摘要正文全部一致时，才恢复为 acompact 子 agent；证据不唯一时仍保持 unmatched。
 """
 
 import argparse
@@ -19,10 +22,17 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
-from capture_core import SCHEMA_VERSION, body_representation, utc_timestamp, write_json
+from capture_core import (
+    SCHEMA_VERSION,
+    body_representation,
+    is_messages_request_path,
+    utc_timestamp,
+    write_json,
+)
 
 
 # request.json 完整支持的顶层字段只有下面 6 个。此列表同时是实际输出白名单：
@@ -167,6 +177,52 @@ class CaptureRecord:
     def message_id(self) -> Optional[str]:
         value = self.response.get("message_id")
         return value if isinstance(value, str) and value else None
+
+
+@dataclass(frozen=True)
+class CompactBoundary:
+    """主 session 中能够证明一次自动压缩已经落盘的边界。"""
+
+    task_id: str
+    task_dir: str
+    harbor_agent_id: Optional[str]
+    session_id: str
+    boundary_uuid: str
+    boundary_timestamp: str
+    boundary_line: int
+    session_file: str
+    synthetic_message_text: str
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        return (self.session_file, self.boundary_uuid)
+
+    def recovered_location(self, message_id: str) -> SessionLocation:
+        return SessionLocation(
+            message_id=message_id,
+            task_id=self.task_id,
+            task_dir=self.task_dir,
+            harbor_agent_id=self.harbor_agent_id,
+            session_id=self.session_id,
+            actor_type="subagent",
+            agent_id=f"acompact-recovered-{self.boundary_uuid}",
+            agent_type="acompact-recovered",
+            agent_description=(
+                "Automatic compaction response recovered from its captured HTTP "
+                "exchange and the main-session compact boundary"
+            ),
+            first_timestamp=self.boundary_timestamp,
+            first_line=self.boundary_line,
+            session_file=self.session_file,
+            source_files=[self.session_file],
+        )
+
+
+@dataclass(frozen=True)
+class CompactCaptureEvidence:
+    session_id: str
+    response_summary: str
+    response_finished_at: datetime
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -497,6 +553,318 @@ def build_session_index(
     return index, conflicts, stats
 
 
+COMPACT_PROMPT_MARKERS = (
+    "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.",
+    "Your task is to create a detailed summary of the conversation so far",
+    "<summary>",
+)
+COMPACT_SYNTHETIC_MARKERS = (
+    "This session is being continued from a previous conversation",
+    "Summary:",
+)
+COMPACT_MAX_BOUNDARY_DELAY_SECONDS = 300
+COMPACT_MAX_CLOCK_LEAD_SECONDS = 5
+COMPACT_MIN_SUMMARY_CHARACTERS = 128
+COMPACT_SUMMARY_PATTERN = re.compile(r"<summary>\s*(.*?)\s*</summary>", re.DOTALL)
+
+
+def content_text(content: Any) -> str:
+    """取 Anthropic content string 或 text blocks 中的可见文本。"""
+
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif (
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ):
+            parts.append(block["text"])
+    return "\n".join(parts)
+
+
+def capture_is_messages_request(capture: CaptureRecord) -> bool:
+    """兼容旧标记，并按 method/path 修正带网关前缀的历史 capture。"""
+
+    if bool(capture.request.get("is_messages_request")):
+        return True
+    return is_messages_request_path(
+        capture.request.get("method"), capture.request.get("path")
+    )
+
+
+def capture_request_body(capture: CaptureRecord) -> Optional[dict[str, Any]]:
+    value = capture.request.get("body_json")
+    if isinstance(value, dict):
+        return value
+    body_path = capture.capture_dir / "request.body"
+    try:
+        value = json.loads(body_path.read_bytes())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def captured_request_header(capture: CaptureRecord, name: str) -> Optional[str]:
+    """只在 capture 中存在一个唯一、未脱敏的 header 值时返回它。"""
+
+    headers = capture.request.get("headers")
+    target = name.lower()
+    values: set[str] = set()
+    if isinstance(headers, dict):
+        for key, value in headers.items():
+            if isinstance(key, str) and key.lower() == target and isinstance(value, str):
+                values.add(value)
+    elif isinstance(headers, list):
+        for record in headers:
+            if not isinstance(record, dict):
+                continue
+            header_name = record.get("name")
+            value = record.get("value")
+            if (
+                isinstance(header_name, str)
+                and header_name.lower() == target
+                and isinstance(value, str)
+                and value != "<redacted>"
+            ):
+                values.add(value)
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def parse_timestamp(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def compact_capture_evidence(
+    capture: CaptureRecord,
+) -> Optional[CompactCaptureEvidence]:
+    """验证 capture 是否完整呈现了 Claude Code 的专用自动压缩交换。"""
+
+    if not capture_is_messages_request(capture):
+        return None
+    if capture.state.get("state") != "complete":
+        return None
+    session_id = captured_request_header(capture, "x-claude-code-session-id")
+    if session_id is None:
+        return None
+
+    body = capture_request_body(capture)
+    messages = body.get("messages") if isinstance(body, dict) else None
+    if not isinstance(messages, list) or not messages:
+        return None
+    last_message = messages[-1]
+    if not isinstance(last_message, dict) or last_message.get("role") != "user":
+        return None
+    prompt = content_text(last_message.get("content"))
+    if not all(marker in prompt for marker in COMPACT_PROMPT_MARKERS):
+        return None
+
+    message = capture.response.get("message")
+    message_id = capture.message_id
+    if (
+        not isinstance(message, dict)
+        or message.get("role") != "assistant"
+        or not message_id
+        or message.get("id") != message_id
+    ):
+        return None
+    response_text = content_text(message.get("content"))
+    summary_matches = COMPACT_SUMMARY_PATTERN.findall(response_text)
+    if len(summary_matches) != 1:
+        return None
+    summary = summary_matches[0].strip()
+    if len(summary) < COMPACT_MIN_SUMMARY_CHARACTERS:
+        return None
+    finished_at = parse_timestamp(capture.response.get("finished_at"))
+    if finished_at is None:
+        return None
+    return CompactCaptureEvidence(
+        session_id=session_id,
+        response_summary=summary,
+        response_finished_at=finished_at,
+    )
+
+
+def discover_compact_boundaries(
+    harbor_root: Path,
+    session_files: list[Path],
+    task_context_resolver: Optional[Callable[[Path, Path], tuple[str, Path]]] = None,
+) -> list[CompactBoundary]:
+    """寻找主 session 中已被 synthetic summary 确认的 compact_boundary。"""
+
+    resolve_task_context = task_context_resolver or task_context
+    agent_id_cache: dict[Path, Optional[str]] = {}
+    discovered: dict[tuple[str, str], CompactBoundary] = {}
+
+    for session_file in sorted(session_files):
+        # 已正常落盘的 subagent（包括旧 acompact）继续走 message.id 主路径；恢复
+        # 只针对缺失 agent-acompact JSONL 时留在主 session 中的 compact 边界。
+        if subagent_id_from_path(session_file) is not None:
+            continue
+        task_id, task_dir = resolve_task_context(session_file, harbor_root)
+        if task_dir not in agent_id_cache:
+            agent_id_cache[task_dir] = find_harbor_agent_id(task_dir)
+        pending: dict[str, tuple[str, str, int]] = {}
+
+        for line_number, record in jsonl_records(session_file):
+            if (
+                record.get("type") == "system"
+                and record.get("subtype") == "compact_boundary"
+                and record.get("isSidechain") is not True
+            ):
+                boundary_uuid = record.get("uuid")
+                logical_parent = record.get("logicalParentUuid")
+                boundary_timestamp = record.get("timestamp")
+                session_id_value = record.get("sessionId") or record.get("session_id")
+                if (
+                    isinstance(boundary_uuid, str)
+                    and boundary_uuid
+                    and isinstance(logical_parent, str)
+                    and logical_parent
+                    and isinstance(boundary_timestamp, str)
+                    and parse_timestamp(boundary_timestamp) is not None
+                ):
+                    session_id = (
+                        session_id_value
+                        if isinstance(session_id_value, str) and session_id_value
+                        else session_file.stem
+                    )
+                    pending[boundary_uuid] = (
+                        session_id,
+                        boundary_timestamp,
+                        line_number,
+                    )
+                continue
+
+            if record.get("type") != "user" or not (
+                record.get("isCompactSummary") is True
+                or record.get("is_compact_summary") is True
+            ):
+                continue
+            parent_uuid = record.get("parentUuid") or record.get("parent_uuid")
+            if not isinstance(parent_uuid, str) or parent_uuid not in pending:
+                continue
+            message = record.get("message")
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            synthetic_text = content_text(message.get("content"))
+            if not all(marker in synthetic_text for marker in COMPACT_SYNTHETIC_MARKERS):
+                continue
+
+            session_id, boundary_timestamp, boundary_line = pending[parent_uuid]
+            synthetic_session_id = record.get("sessionId") or record.get("session_id")
+            if (
+                isinstance(synthetic_session_id, str)
+                and synthetic_session_id
+                and synthetic_session_id != session_id
+            ):
+                continue
+            session_file_value = str(session_file.resolve())
+            boundary = CompactBoundary(
+                task_id=task_id,
+                task_dir=str(task_dir.resolve()),
+                harbor_agent_id=agent_id_cache[task_dir],
+                session_id=session_id,
+                boundary_uuid=parent_uuid,
+                boundary_timestamp=boundary_timestamp,
+                boundary_line=boundary_line,
+                session_file=session_file_value,
+                synthetic_message_text=synthetic_text,
+            )
+            discovered[boundary.identity] = boundary
+
+    return list(discovered.values())
+
+
+def compact_boundary_matches(
+    evidence: CompactCaptureEvidence, boundary: CompactBoundary
+) -> bool:
+    if evidence.session_id != boundary.session_id:
+        return False
+    boundary_timestamp = parse_timestamp(boundary.boundary_timestamp)
+    if boundary_timestamp is None:
+        return False
+    delay = (boundary_timestamp - evidence.response_finished_at).total_seconds()
+    if not (
+        -COMPACT_MAX_CLOCK_LEAD_SECONDS
+        <= delay
+        <= COMPACT_MAX_BOUNDARY_DELAY_SECONDS
+    ):
+        return False
+    response_summary = evidence.response_summary.replace("\r\n", "\n")
+    synthetic_text = boundary.synthetic_message_text.replace("\r\n", "\n")
+    return response_summary in synthetic_text
+
+
+def build_compact_recovery_index(
+    captures: list[CaptureRecord],
+    boundaries: list[CompactBoundary],
+    session_index: dict[str, SessionLocation],
+    session_conflicts: dict[str, list[SessionLocation]],
+    duplicate_capture_ids: set[str],
+) -> tuple[dict[str, SessionLocation], dict[str, int]]:
+    """建立严格的一对一 compact capture -> 主 session 边界恢复索引。"""
+
+    stats = {
+        "eligible_boundaries": len(boundaries),
+        "compact_evidence_captures": 0,
+        "recovered_associations": 0,
+        "ambiguous_captures": 0,
+        "no_matching_boundary": 0,
+    }
+    proposals: dict[str, CompactBoundary] = {}
+    boundary_uses: dict[tuple[str, str], int] = {}
+
+    for capture in captures:
+        message_id = capture.message_id
+        if (
+            not message_id
+            or message_id in session_index
+            or message_id in session_conflicts
+            or message_id in duplicate_capture_ids
+        ):
+            continue
+        evidence = compact_capture_evidence(capture)
+        if evidence is None:
+            continue
+        stats["compact_evidence_captures"] += 1
+        matches = [
+            boundary
+            for boundary in boundaries
+            if compact_boundary_matches(evidence, boundary)
+        ]
+        if not matches:
+            stats["no_matching_boundary"] += 1
+            continue
+        if len(matches) != 1:
+            stats["ambiguous_captures"] += 1
+            continue
+        boundary = matches[0]
+        proposals[message_id] = boundary
+        boundary_uses[boundary.identity] = boundary_uses.get(boundary.identity, 0) + 1
+
+    recovered: dict[str, SessionLocation] = {}
+    for message_id, boundary in proposals.items():
+        if boundary_uses[boundary.identity] != 1:
+            stats["ambiguous_captures"] += 1
+            continue
+        recovered[message_id] = boundary.recovered_location(message_id)
+
+    stats["recovered_associations"] = len(recovered)
+    return recovered, stats
+
+
 def resolve_raw_root(capture_root: Path) -> Path:
     """兼容传入 ``--log-dir`` 和直接传入其 ``raw`` 子目录两种用法。"""
     nested = capture_root / "raw"
@@ -678,6 +1046,7 @@ def finalize_dataset(
     分类规则：
 
     * 有唯一 message id 且在 session 索引中唯一命中 -> tasks；
+    * 缺失 acompact JSONL，但 compact 的多项证据唯一命中主 session 边界 -> tasks；
     * Messages 请求缺少/找不到 message id -> unmatched；
     * 非 Messages 辅助请求缺少匹配 -> auxiliary；
     * session 语义冲突或多个 capture 共用 message id -> conflicts。
@@ -716,9 +1085,14 @@ def finalize_dataset(
         "response.json",
     )
     ensure_empty_output(output_root)
+    files_to_scan = (
+        sorted(session_files)
+        if session_files is not None
+        else discover_session_files(harbor_root)
+    )
     session_index, session_conflicts, session_stats = build_session_index(
         harbor_root,
-        session_files=session_files,
+        session_files=files_to_scan,
         task_context_resolver=task_context_resolver,
     )
     captures, inflight_count = load_captures(capture_root)
@@ -732,21 +1106,36 @@ def finalize_dataset(
         for message_id, values in captures_by_message.items()
         if len(values) > 1
     }
+    compact_boundaries = discover_compact_boundaries(
+        harbor_root,
+        files_to_scan,
+        task_context_resolver=task_context_resolver,
+    )
+    compact_recovery_index, compact_recovery_stats = build_compact_recovery_index(
+        captures,
+        compact_boundaries,
+        session_index,
+        session_conflicts,
+        duplicate_capture_ids,
+    )
 
     matched: dict[tuple[str, str, str], list[tuple[CaptureRecord, SessionLocation]]] = {}
     unmatched: list[CaptureRecord] = []
     auxiliary: list[CaptureRecord] = []
     conflict_records: list[tuple[CaptureRecord, list[SessionLocation]]] = []
     filtered_count = 0
+    recovered_compact_exported = 0
 
     for capture in captures:
         message_id = capture.message_id
-        is_messages = bool(capture.request.get("is_messages_request"))
+        is_messages = capture_is_messages_request(capture)
         if not message_id:
             (unmatched if is_messages else auxiliary).append(capture)
             continue
         normal_location = session_index.get(message_id)
         candidates = session_conflicts.get(message_id, [])
+        if normal_location is None and not candidates:
+            normal_location = compact_recovery_index.get(message_id)
         if candidates and location_filter is not None:
             candidates = [candidate for candidate in candidates if location_filter(candidate)]
             if not candidates:
@@ -780,6 +1169,8 @@ def finalize_dataset(
         # 先按 task + actor 类型 + agent id 分组，再在每个 agent 内部编号 round。
         key = (location.task_id, location.actor_type, actor_id)
         matched.setdefault(key, []).append((capture, location))
+        if message_id in compact_recovery_index:
+            recovered_compact_exported += 1
 
     task_summary: dict[str, dict[str, Any]] = {}
     task_folders: dict[str, Path] = {}
@@ -908,6 +1299,7 @@ def finalize_dataset(
             },
         )
 
+    compact_recovery_stats["exported_captures"] = recovered_compact_exported
     report = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": utc_timestamp(),
@@ -926,6 +1318,7 @@ def finalize_dataset(
         "session_conflict_ids": len(session_conflicts),
         "duplicate_capture_message_ids": len(duplicate_capture_ids),
         "session_scan": session_stats,
+        "compact_recovery": compact_recovery_stats,
     }
     if task_output_group_resolver is not None:
         report["task_output_groups"] = output_group_counts

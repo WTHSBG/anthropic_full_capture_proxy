@@ -40,7 +40,19 @@ Harbor/Claude Code session 中 assistant.message.id
 
 同一个 `message.id` 在 session 中出现多条 assistant 记录时，会合并为一个模型 round。主/子 agent 由 session 文件路径、`agentId` 和 `isSidechain` 共同判断，其中 `subagents/agent-*.jsonl` 文件路径优先。
 
-相邻时间、客户端 IP 和 prompt 内容都不参与关联。无法精确关联的数据只进入 `unmatched`，不会根据时间或 IP 自动猜测。
+Messages 请求识别兼容标准 `POST /v1/messages` 及网关添加前缀后的路径（例如 `POST /anthropic/v1/messages`）；`/v1/messages/count_tokens` 不会被误判。finalizer 也会按 method/path 重新识别旧 capture，因此修复前被记录成 `is_messages_request: false` 的前缀路径无需重采。
+
+普通请求不使用相邻时间、客户端 IP 或 prompt 内容做关联。唯一例外是 Claude Code 没有写出 `subagents/agent-acompact-*.jsonl` 的自动压缩请求。此时必须同时满足：
+
+- HTTP 请求是 Messages 路径且状态完整
+- `x-claude-code-session-id` 与主 session 完全一致
+- 最后一条 user message 包含 Claude Code 专用 compact 指令
+- 主 session 存在 `compact_boundary` 及其 `isCompactSummary` synthetic user message
+- HTTP 响应完成时间与边界相邻
+- 响应 `<summary>` 正文完整出现在 synthetic message 中
+- capture 与边界是一对一唯一匹配
+
+全部满足后，最终数据集中会创建 `subagent_acompact-recovered-<boundary_uuid>`；它不会修改或伪造源目录中的 `subagents/*.jsonl`。任何证据缺失、冲突或多义时仍进入 `unmatched`。恢复统计写入 `finalization_report.json.compact_recovery`。
 
 ## 保证范围
 
@@ -49,6 +61,7 @@ Harbor/Claude Code session 中 assistant.message.id
 - 已捕获的每个请求与其 HTTP 响应不会串位
 - 标准完整 SSE 可以聚合成完整 Message
 - 有唯一 `message.id` 且 session 已保存时，可精确归到 task 和具体 agent
+- 缺失 acompact JSONL 时，只按上述一对一证据恢复压缩请求
 - 冲突不会覆盖，统一进入 `conflicts`
 
 不能绝对保证：

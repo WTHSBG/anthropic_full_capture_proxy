@@ -11,6 +11,7 @@ from capture_core import (
     RequestCapture,
     SSEDecoder,
     header_records,
+    is_messages_request_path,
     write_json,
 )
 from finalize import CaptureRecord, final_request, final_response, finalize_dataset
@@ -203,6 +204,26 @@ class AggregatorTests(unittest.TestCase):
 
 
 class CaptureIsolationTests(unittest.TestCase):
+    def test_messages_path_accepts_gateway_prefix_without_broadening_endpoint(self):
+        for path in (
+            "/v1/messages",
+            "/v1/messages/",
+            "/anthropic/v1/messages",
+            "/gateway/anthropic/v1/messages/",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(is_messages_request_path("POST", path))
+
+        for method, path in (
+            ("GET", "/v1/messages"),
+            ("POST", "/v1/messages/count_tokens"),
+            ("POST", "/anthropic/v1/messages/count_tokens"),
+            ("POST", "/anthropic/messages"),
+            ("POST", "/not-v1/messages-extra"),
+        ):
+            with self.subTest(method=method, path=path):
+                self.assertFalse(is_messages_request_path(method, path))
+
     def test_two_interleaved_streams_never_share_files(self):
         with workspace_temporary_directory() as temporary:
             root = Path(temporary)
@@ -315,6 +336,107 @@ class FinalizerTests(unittest.TestCase):
             },
         )
         write_json(directory / "state.json", {"state": "complete"})
+
+    def _write_unindexed_capture(
+        self,
+        root: Path,
+        capture_id: str,
+        message_id: str,
+        *,
+        session_id: str,
+        prompt: str,
+        response_text: str,
+    ) -> None:
+        directory = root / "raw/completed" / capture_id
+        directory.mkdir(parents=True)
+        request_value = {
+            "model": "test-model",
+            "max_tokens": 1000,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+        }
+        request_body = json.dumps(request_value, separators=(",", ":")).encode()
+        response_value = {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": response_text}],
+        }
+        (directory / "request.body").write_bytes(request_body)
+        (directory / "response.body").write_bytes(
+            json.dumps(response_value, separators=(",", ":")).encode()
+        )
+        write_json(
+            directory / "request.json",
+            {
+                "capture_id": capture_id,
+                "captured_at": "2026-01-01T00:00:00Z",
+                "method": "POST",
+                "path": "/anthropic/v1/messages",
+                # 模拟修复前 capture_core.py 已经写出的历史记录。
+                "is_messages_request": False,
+                "headers": [
+                    {
+                        "name": "x-claude-code-session-id",
+                        "value": session_id,
+                    }
+                ],
+                "body_json": request_value,
+            },
+        )
+        write_json(
+            directory / "response.json",
+            {
+                "capture_id": capture_id,
+                "message_id": message_id,
+                "finished_at": "2026-01-01T00:00:10Z",
+                "stream": True,
+                "message": response_value,
+            },
+        )
+        write_json(directory / "state.json", {"state": "complete"})
+
+    def _write_compact_boundary_session(
+        self, harbor_root: Path, *, session_id: str, summary: str
+    ) -> Path:
+        task_root = harbor_root / "tasks/task_a"
+        project = task_root / "logs/run/cc_session/.claude/projects/-workspace"
+        project.mkdir(parents=True)
+        session_file = project / f"{session_id}.jsonl"
+        records = [
+            {
+                "type": "system",
+                "subtype": "compact_boundary",
+                "uuid": "boundary-1",
+                "logicalParentUuid": "previous-event",
+                "isSidechain": False,
+                "timestamp": "2026-01-01T00:00:10.200Z",
+                "sessionId": session_id,
+            },
+            {
+                "type": "user",
+                "uuid": "synthetic-1",
+                "parentUuid": "boundary-1",
+                "isSidechain": False,
+                "isCompactSummary": True,
+                "timestamp": "2026-01-01T00:00:10.201Z",
+                "sessionId": session_id,
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "This session is being continued from a previous conversation "
+                        "that ran out of context.\n\nSummary:\n"
+                        + summary
+                        + "\n\nContinue from this summary."
+                    ),
+                },
+            },
+        ]
+        session_file.write_text(
+            "\n".join(json.dumps(item) for item in records) + "\n",
+            encoding="utf-8",
+        )
+        return session_file
 
     def test_harbor_main_and_subagent_are_finalized(self):
         with workspace_temporary_directory() as temporary:
@@ -512,6 +634,124 @@ class FinalizerTests(unittest.TestCase):
 
             self.assertEqual(report["matched"], 0)
             self.assertEqual(report["conflicts"], 1)
+
+    def test_missing_acompact_jsonl_is_recovered_from_strict_boundary_evidence(self):
+        with workspace_temporary_directory() as temporary:
+            root = Path(temporary)
+            capture_root = root / "captures"
+            harbor_root = root / "harbor-run"
+            output_root = root / "dataset"
+            session_id = "session-compact"
+            summary = "Recovered compact context with exact content. " * 8
+            prompt = (
+                "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
+                "Your task is to create a detailed summary of the conversation so far.\n"
+                "Return the result inside <summary> tags."
+            )
+            self._write_unindexed_capture(
+                capture_root,
+                "cap_compact_missing_jsonl",
+                "msg_compact_missing_jsonl",
+                session_id=session_id,
+                prompt=prompt,
+                response_text=(
+                    "<analysis>checked</analysis>\n<summary>\n"
+                    + summary
+                    + "\n</summary>"
+                ),
+            )
+            self._write_compact_boundary_session(
+                harbor_root, session_id=session_id, summary=summary
+            )
+
+            report = finalize_dataset(capture_root, harbor_root, output_root)
+
+            self.assertEqual(report["matched"], 1)
+            self.assertEqual(report["unmatched"], 0)
+            self.assertEqual(report["auxiliary"], 0)
+            self.assertEqual(
+                report["compact_recovery"]["recovered_associations"], 1
+            )
+            self.assertEqual(report["compact_recovery"]["exported_captures"], 1)
+            recovered_folder = (
+                output_root
+                / "tasks/task_a/subagent_acompact-recovered-boundary-1"
+            )
+            response = json.loads(
+                (recovered_folder / "round_000001/response.json").read_text("utf-8")
+            )
+            self.assertEqual(response["association"]["actor_type"], "subagent")
+            self.assertEqual(
+                response["association"]["agent_type"], "acompact-recovered"
+            )
+            self.assertEqual(response["association"]["session_id"], session_id)
+
+    def test_prefixed_regular_message_is_unmatched_not_false_compact_or_auxiliary(self):
+        with workspace_temporary_directory() as temporary:
+            root = Path(temporary)
+            capture_root = root / "captures"
+            harbor_root = root / "harbor-run"
+            output_root = root / "dataset"
+            session_id = "session-compact"
+            summary = "Recovered compact context with exact content. " * 8
+            self._write_unindexed_capture(
+                capture_root,
+                "cap_regular_unindexed",
+                "msg_regular_unindexed",
+                session_id=session_id,
+                prompt="Please summarize this ordinary request.",
+                response_text="<summary>" + summary + "</summary>",
+            )
+            self._write_compact_boundary_session(
+                harbor_root, session_id=session_id, summary=summary
+            )
+
+            report = finalize_dataset(capture_root, harbor_root, output_root)
+
+            self.assertEqual(report["matched"], 0)
+            self.assertEqual(report["unmatched"], 1)
+            self.assertEqual(report["auxiliary"], 0)
+            self.assertEqual(
+                report["compact_recovery"]["recovered_associations"], 0
+            )
+            self.assertTrue(
+                (output_root / "unmatched/cap_regular_unindexed/request.json").exists()
+            )
+
+    def test_compact_recovery_refuses_multiple_captures_for_one_boundary(self):
+        with workspace_temporary_directory() as temporary:
+            root = Path(temporary)
+            capture_root = root / "captures"
+            harbor_root = root / "harbor-run"
+            output_root = root / "dataset"
+            session_id = "session-compact"
+            summary = "The same compact summary must not be claimed twice. " * 8
+            prompt = (
+                "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
+                "Your task is to create a detailed summary of the conversation so far.\n"
+                "Return one <summary> block."
+            )
+            for suffix in ("one", "two"):
+                self._write_unindexed_capture(
+                    capture_root,
+                    f"cap_{suffix}",
+                    f"msg_{suffix}",
+                    session_id=session_id,
+                    prompt=prompt,
+                    response_text="<summary>" + summary + "</summary>",
+                )
+            self._write_compact_boundary_session(
+                harbor_root, session_id=session_id, summary=summary
+            )
+
+            report = finalize_dataset(capture_root, harbor_root, output_root)
+
+            self.assertEqual(report["matched"], 0)
+            self.assertEqual(report["unmatched"], 2)
+            self.assertEqual(report["compact_recovery"]["ambiguous_captures"], 2)
+            self.assertEqual(
+                report["compact_recovery"]["recovered_associations"], 0
+            )
 
 
 class OutputPartsTests(unittest.TestCase):
@@ -919,7 +1159,6 @@ class ProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(api_key_record["value"], "<redacted>")
 
-
 class ConfigurationTests(unittest.TestCase):
     def test_authentication_is_passthrough_only(self):
         settings = parse_args(
@@ -934,7 +1173,6 @@ class ConfigurationTests(unittest.TestCase):
         records = header_records([("X-Api-Key", "secret")])
         self.assertEqual(records[0]["value"], "<redacted>")
         self.assertIn("value_sha256", records[0])
-
 
 if __name__ == "__main__":
     unittest.main()
