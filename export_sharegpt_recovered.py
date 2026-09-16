@@ -22,6 +22,8 @@ from typing import Any, Optional
 import export_sharegpt as base
 from capture_core import write_json
 
+COMBINED_JSONL_NAME = "sharegpt.jsonl"
+
 
 @dataclass(frozen=True)
 class SourceRound:
@@ -392,12 +394,30 @@ def mask_assistant_history(record: dict[str, Any]) -> int:
     return max(0, len(assistant_indexes) - 1)
 
 
+def write_combined_jsonl(output_dir: Path, record_paths: list[Path]) -> Path:
+    """按稳定顺序将独立 ShareGPT JSON 合并为一行一个对象的 JSONL。"""
+
+    destination = output_dir / COMBINED_JSONL_NAME
+    temporary = output_dir / f".{COMBINED_JSONL_NAME}.tmp"
+    with temporary.open("w", encoding="utf-8") as handle:
+        for path in sorted(record_paths):
+            json.dump(
+                base.read_json_object(path),
+                handle,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            handle.write("\n")
+    temporary.replace(destination)
+    return destination
+
+
 def export_sharegpt_recovered(
     input_dir: Path,
     output_dir: Path,
     reasoning_mode: str,
     standard_structure: bool = True,
-    mask_compact_assistant_history: bool = False,
+    mask_compact_assistant_history: bool = True,
 ) -> dict[str, Any]:
     """执行兼容原格式的导出，并额外生成 recovery_report.json。"""
 
@@ -415,6 +435,7 @@ def export_sharegpt_recovered(
     file_count = 0
     split_count = 0
     masked_assistant_count = 0
+    record_paths: list[Path] = []
     errors: list[dict[str, Any]] = []
     recoveries: list[dict[str, Any]] = []
 
@@ -460,9 +481,12 @@ def export_sharegpt_recovered(
                 )
                 if mask_compact_assistant_history and is_compact_agent_dir(agent_dir):
                     masked_assistant_count += mask_assistant_history(record)
-                write_json(task_output / f"{file_stem}.json", record, compact=True)
+                record_path = task_output / f"{file_stem}.json"
+                write_json(record_path, record, compact=True)
+                record_paths.append(record_path)
                 file_count += 1
 
+    combined_jsonl_path = write_combined_jsonl(output_dir, record_paths)
     error_report_path = output_dir / "export_errors.json"
     recovery_report_path = output_dir / "recovery_report.json"
     write_json(
@@ -488,6 +512,8 @@ def export_sharegpt_recovered(
         "agents": agent_count,
         "rounds": round_count,
         "sharegpt_files": file_count,
+        "combined_jsonl": str(combined_jsonl_path.resolve()),
+        "combined_jsonl_records": file_count,
         "context_splits": split_count,
         "recovered_rounds": len(recoveries),
         "skipped_agents": len(errors),
@@ -542,10 +568,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.set_defaults(standard_structure=True)
     parser.add_argument(
         "--mask-compact-assistant-history",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "仅对正常及恢复出的 acompact 子 agent，将最终 ShareGPT 消息中最后一条 "
-            "assistant 之前的 assistant role 改为 masked_assistant"
+            "assistant 之前的 assistant role 改为 masked_assistant（默认开启）"
         ),
     )
     return parser.parse_args(argv)

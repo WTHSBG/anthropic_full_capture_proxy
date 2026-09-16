@@ -62,7 +62,7 @@ class RecoveredShareGPTMaskingTests(unittest.TestCase):
             )
             return [message["role"] for message in record["messages"]], report
 
-    def test_default_keeps_compact_assistant_roles(self):
+    def test_explicit_opt_out_keeps_compact_assistant_roles(self):
         roles, report = self._export_roles(
             "subagent_acompact-auto", mask_compact_assistant_history=False
         )
@@ -107,15 +107,48 @@ class RecoveredShareGPTMaskingTests(unittest.TestCase):
         )
         self.assertEqual(report["masked_assistant_messages"], 0)
 
-    def test_cli_flag_is_opt_in(self):
+    def test_default_masks_and_writes_combined_jsonl(self):
+        with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as temporary:
+            root = Path(temporary)
+            input_dir = root / "dataset"
+            output_dir = root / "sharegpt"
+            self._write_agent(input_dir, "subagent_acompact-auto")
+
+            report = export_sharegpt_recovered.export_sharegpt_recovered(
+                input_dir, output_dir, reasoning_mode="separate"
+            )
+            record = json.loads(
+                (output_dir / "task_a/subagent_acompact-auto_1.json").read_text()
+            )
+            combined_lines = (output_dir / "sharegpt.jsonl").read_text().splitlines()
+
+            self.assertEqual(
+                [message["role"] for message in record["messages"]],
+                [
+                    "system",
+                    "user",
+                    "masked_assistant",
+                    "user",
+                    "masked_assistant",
+                    "user",
+                    "assistant",
+                ],
+            )
+            self.assertEqual([json.loads(line) for line in combined_lines], [record])
+            self.assertEqual(report["combined_jsonl_records"], 1)
+            self.assertEqual(
+                report["combined_jsonl"], str((output_dir / "sharegpt.jsonl").resolve())
+            )
+
+    def test_cli_mask_is_opt_out(self):
         common = ["--input-dir", "input", "--output-dir", "output"]
 
-        self.assertFalse(
+        self.assertTrue(
             export_sharegpt_recovered.parse_args(common).mask_compact_assistant_history
         )
-        self.assertTrue(
+        self.assertFalse(
             export_sharegpt_recovered.parse_args(
-                [*common, "--mask-compact-assistant-history"]
+                [*common, "--no-mask-compact-assistant-history"]
             ).mask_compact_assistant_history
         )
 
