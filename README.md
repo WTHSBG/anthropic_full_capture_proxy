@@ -1,8 +1,14 @@
 # Anthropic Full Capture Proxy
 
-透明转发 Anthropic Messages API，完整保存每次 HTTP 请求、非流式响应、原始 SSE、SSE 事件和聚合后的完整 Message。Harbor/Claude Code 运行结束后，再使用 session JSONL 按 `message.id` 整理成 `task / main agent / subagent / round` 数据集。
+透明转发 Anthropic Messages、OpenAI Chat Completions 与 Responses API，完整保存每次 HTTP 请求、非流式响应、原始 SSE、SSE 事件和聚合响应。支持 Claude Code、Kimi Code CLI 与 NousResearch Hermes Agent，运行结束后整理为 `task / main agent / subagent / round` 数据集并导出 ShareGPT。
+
+Claude Code 默认按 session `message.id` 关联；Kimi 优先使用 Wire 响应 ID；Hermes 使用 SQLite 中完整历史与响应的一对一唯一匹配。原生 compact 通过完成边界与摘要证据恢复归属，后继会话仍归同一任务。新客户端的配置、命令及支持边界见 [Kimi Code 与 Hermes 接入](README_07_Kimi_Code与Hermes.md)。
 
 本项目不会修改请求 body、模型名称或认证方式。Harbor/Claude Code 发来的 `Authorization`、`X-Api-Key` 等认证头会原样转发给上游；采集文件中的密钥值会脱敏并只保存 SHA-256。
+
+采集写盘与解析在有界后台任务中执行。采集故障或积压超限时继续转发，健康接口明确
+报告失败，能保存的残缺记录保留在 `partial` / `inflight`。整理前等待后台采集完成并
+核对失败计数，具体参数与检查方法见[安装并启动代理](README_01_安装并启动代理.md)。
 
 ## 按运行顺序阅读
 
@@ -12,13 +18,14 @@
 4. [导出 ShareGPT SFT 数据](README_04_导出_ShareGPT.md)
 5. [采集与关联机制](README_05_采集与关联机制.md)（参考）
 6. [测试与运维](README_06_测试与运维.md)（参考）
+7. [Kimi Code 与 Hermes 接入](README_07_Kimi_Code与Hermes.md)
 
 ## 工作流程
 
 ```text
-多个 Harbor / Claude Code
+Harbor / Claude Code / Kimi Code / Hermes
         │
-        │ POST /v1/messages
+        │ Messages / Chat Completions / Responses
         ▼
 proxy.py
   ├─ 为每个请求生成独立 capture_id
@@ -34,7 +41,7 @@ capture_logs/<run>/raw/{inflight,completed}
 finalize.py / finalize-harbor.py / finalize-node.py
   ├─ 扫描主 session JSONL
   ├─ 扫描 subagents/agent-*.jsonl
-  ├─ response.message.id == session message.id
+  ├─ 响应 ID 或完整历史的一对一唯一关联
   └─ 生成最终 task/agent/round 数据集
         │
         │ 可选
@@ -44,6 +51,21 @@ export_sharegpt.py / export_sharegpt_recovered.py
   └─ 有重试或后续历史证据时恢复异常流式聚合
 ```
 
-代理只负责保证每个 HTTP 请求和它自己的响应不串。task、主 agent、子 agent 的语义归属由整理脚本在运行结束后从 Harbor session 精确恢复，因此不需要修改带任务前缀的 LLM 地址。
+代理为每个 HTTP 请求独立采集其响应。task、主 agent、子 agent 的归属由整理脚本在运行结束后从客户端会话恢复；不需要给 LLM 地址增加任务前缀。有歧义或证据不足的记录保留在 conflicts/unmatched。
 
 恢复版导出器的适用场景、证据要求和不可恢复边界见[导出 ShareGPT SFT 数据](README_04_导出_ShareGPT.md#恢复版的证据和边界)。
+
+## 验证与支持边界
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+77 项自动化测试覆盖原有 Claude Code 路径、新客户端关联/导出、compact 和采集故障。
+真实 Kimi/Hermes 文件工具及原生压缩已另行验收；受测版本和范围见
+[验收说明](tests/ACCEPTANCE.md)。文本、可见 reasoning 和 function 工具可导出；
+未知协议内容、缺失会话和非唯一证据保持未关联或拒绝有损导出。
+
+压缩样本需历史 assistant mask 时使用恢复版导出器：最后一条摘要仍为 assistant，
+此前 assistant 标为 masked_assistant；具体训练字段与规则见
+[导出说明](README_04_导出_ShareGPT.md#kimi--hermes-与压缩轨迹)。

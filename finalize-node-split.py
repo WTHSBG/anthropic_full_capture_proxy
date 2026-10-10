@@ -19,6 +19,7 @@ from typing import Callable, Optional
 
 from capture_core import write_json
 from finalize import SessionLocation, finalize_dataset
+from session_adapters import client_task_context, discover_session_sources
 
 
 # 与原 finalize-node.py 一致，保留 node 导出的全部请求字段。
@@ -279,16 +280,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="兼容旧用法：只导出成功任务，此时 failed/tasks 保持为空",
     )
+    parser.add_argument("--client", choices=("cc", "kimi", "hermes"), default="cc", help="会话客户端格式，默认 cc")
     return parser.parse_args(argv)
 
 
 def main() -> None:
     args = parse_args()
-    session_files = discover_node_session_files(args.harbor_run_dir)
+    session_files = (discover_node_session_files(args.harbor_run_dir) if args.client == "cc"
+                     else discover_session_sources(args.harbor_run_dir, args.client))
     result_logs = discover_result_logs(args.harbor_run_dir)
     successful_dirs = successful_task_directories(args.harbor_run_dir, result_logs)
     session_task_dirs = {
-        node_task_context(path, args.harbor_run_dir)[1].resolve()
+        (node_task_context(path, args.harbor_run_dir) if args.client == "cc" else
+         client_task_context(path, args.harbor_run_dir, "node"))[1].resolve()
         for path in session_files
     }
     classifications = result_log_classifications(result_logs)
@@ -303,7 +307,9 @@ def main() -> None:
         harbor_root=args.harbor_run_dir,
         output_root=args.output_dir,
         session_files=session_files,
-        task_context_resolver=node_task_context,
+        task_context_resolver=(node_task_context if args.client == "cc" else
+                               lambda path, root: client_task_context(path, root, "node")),
+        client=args.client,
         location_filter=location_filter,
         task_output_group_resolver=make_result_output_group_resolver(
             successful_dirs

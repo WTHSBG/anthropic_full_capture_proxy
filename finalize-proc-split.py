@@ -25,6 +25,7 @@ from typing import Callable, Optional
 
 from capture_core import write_json
 from finalize import SessionLocation, finalize_dataset
+from session_adapters import client_task_context, discover_session_sources
 
 
 # 与 finalize-node-split.py 一致，保留 node 导出的全部请求和响应字段。
@@ -103,6 +104,7 @@ def classify_result_json(result_path: Path) -> str:
 
 def discover_proc_tasks(
     proc_root: Path,
+    client: str = "cc",
 ) -> tuple[list[ProcTask], list[dict[str, object]], int]:
     """发现 <proc_n>/<group>/<task_id>，跳过缺少轨迹或有效结果的目录。"""
 
@@ -124,6 +126,8 @@ def discover_proc_tasks(
                 if projects_root.is_dir()
                 else []
             )
+            if client != "cc":
+                session_files = tuple(discover_session_sources(task_dir / "logs", client))
             result_path = task_dir / "result.json"
             problems: list[str] = []
             classification: Optional[str] = None
@@ -250,13 +254,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="只导出所有 checks[*].score 均为 1.0 的完整任务",
     )
+    parser.add_argument("--client", choices=("cc", "kimi", "hermes"), default="cc", help="会话客户端格式，默认 cc")
     return parser.parse_args(argv)
 
 
 def main() -> None:
     args = parse_args()
     complete_tasks, skipped_tasks, discovered_task_directories = (
-        discover_proc_tasks(args.proc_dir)
+        discover_proc_tasks(args.proc_dir, args.client)
     )
     session_files = [
         session_file
@@ -286,7 +291,9 @@ def main() -> None:
         harbor_root=args.proc_dir,
         output_root=args.output_dir,
         session_files=session_files,
-        task_context_resolver=proc_task_context,
+        task_context_resolver=(proc_task_context if args.client == "cc" else
+                               lambda path, root: client_task_context(path, root, "proc")),
+        client=args.client,
         location_filter=location_filter,
         task_output_group_resolver=make_result_output_group_resolver(
             successful_task_dirs

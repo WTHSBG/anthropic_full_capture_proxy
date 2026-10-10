@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Optional
 
 from capture_core import RequestCapture, initialize_capture_root
+from capture_sink import CaptureManager
 
 
 # 逐跳 header 只对当前 TCP/HTTP 连接有效，代理不能把它们直接传给下一跳。
@@ -35,6 +36,12 @@ class Settings:
     upstream_url: str
     log_dir: Path
     timeout_seconds: float
+    capture_buffer_bytes: int = 8 * 1024 * 1024
+    capture_max_pending: int = 64
+
+    def __post_init__(self):
+        if self.capture_buffer_bytes <= 0 or self.capture_max_pending <= 0:
+            raise ValueError("采集缓冲区和并发采集上限必须大于零")
 
 
 def filtered_headers(
@@ -78,7 +85,12 @@ def create_app(settings: Settings, upstream_transport: Any = None) -> Any:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        initialize_capture_root(capture_root)
+        app.state.capture_manager = CaptureManager(capture_root, RequestCapture,
+            buffer_bytes=settings.capture_buffer_bytes, max_pending=settings.capture_max_pending)
+        try:
+            await asyncio.to_thread(initialize_capture_root, capture_root)
+        except Exception as exc:
+            app.state.capture_manager.report_failure("initialize", exc)
         timeout = httpx.Timeout(settings.timeout_seconds, read=None)
         app.state.client = httpx.AsyncClient(
             timeout=timeout,
@@ -90,8 +102,9 @@ def create_app(settings: Settings, upstream_transport: Any = None) -> Any:
             yield
         finally:
             await app.state.client.aclose()
+            await app.state.capture_manager.close()
 
-    app = FastAPI(title="Anthropic full capture proxy", lifespan=lifespan)
+    app = FastAPI(title="LLM full capture proxy", lifespan=lifespan)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -99,6 +112,7 @@ def create_app(settings: Settings, upstream_transport: Any = None) -> Any:
             "status": "ok",
             "upstream_url": settings.upstream_url,
             "capture_root": str(capture_root),
+            "capture": app.state.capture_manager.metrics(),
         }
 
     @app.api_route(
@@ -111,10 +125,10 @@ def create_app(settings: Settings, upstream_transport: Any = None) -> Any:
         raw_body = await request.body()
         incoming_headers = request_header_items(request)
         upstream_url = build_upstream_url(settings.upstream_url, request)
-        capture = RequestCapture(capture_root)
+        capture = app.state.capture_manager.create()
 
         # 每个入站请求创建独立 capture 目录。主/子 agent 即使并发，数据也不会写进同一文件。
-        capture.start_request(
+        capture.enqueue("start_request",
             method=request.method,
             path=request.url.path,
             query=request.url.query,
@@ -142,20 +156,24 @@ def create_app(settings: Settings, upstream_transport: Any = None) -> Any:
                 {"type": "error", "error": {"type": "proxy_error", "message": error_text}}
             )
             response_headers = [("content-type", "application/json")]
-            capture.start_response(
+            capture.enqueue("start_response",
                 status_code=502,
                 headers=response_headers,
                 is_sse=False,
                 source="proxy",
             )
-            capture.append_response(error_body)
-            capture.finalize(transport_error=error_text)
+            capture.enqueue("append_response", error_body)
+            capture.finish(transport_error=error_text)
             return Response(content=error_body, status_code=502, media_type="application/json")
+        except BaseException as exc:
+            capture.finish(transport_error=f"{type(exc).__name__}: {exc}",
+                client_disconnected=isinstance(exc, asyncio.CancelledError))
+            raise
 
         upstream_response_headers = list(upstream_response.headers.multi_items())
         content_type = upstream_response.headers.get("content-type", "")
         is_sse = "text/event-stream" in content_type.lower()
-        capture.start_response(
+        capture.enqueue("start_response",
             status_code=upstream_response.status_code,
             headers=upstream_response_headers,
             is_sse=is_sse,
@@ -169,13 +187,13 @@ def create_app(settings: Settings, upstream_transport: Any = None) -> Any:
             try:
                 response_chunks: list[bytes] = []
                 async for chunk in upstream_response.aiter_raw():
-                    capture.append_response(chunk)
+                    capture.enqueue("append_response", chunk)
                     response_chunks.append(chunk)
                 response_body = b"".join(response_chunks)
-                capture.finalize()
+                capture.finish()
             except BaseException as exc:
                 error_text = f"{type(exc).__name__}: {exc}"
-                capture.finalize(
+                capture.finish(
                     transport_error=error_text,
                     client_disconnected=isinstance(exc, asyncio.CancelledError),
                 )
@@ -195,19 +213,21 @@ def create_app(settings: Settings, upstream_transport: Any = None) -> Any:
             client_disconnected = False
             try:
                 async for chunk in upstream_response.aiter_raw():
-                    # 先把上游字节写入本请求的原始文件，再原样交给 CC；聚合器不修改转发内容。
-                    capture.append_response(chunk)
+                    # 转发不等待采集落盘；后台积压或故障只影响采集，并明确报告。
+                    capture.enqueue("append_response", chunk)
                     yield chunk
             except BaseException as exc:
                 transport_error = f"{type(exc).__name__}: {exc}"
                 client_disconnected = isinstance(exc, asyncio.CancelledError)
                 raise
             finally:
-                await upstream_response.aclose()
-                capture.finalize(
-                    transport_error=transport_error,
-                    client_disconnected=client_disconnected,
-                )
+                try:
+                    await upstream_response.aclose()
+                finally:
+                    capture.finish(
+                        transport_error=transport_error,
+                        client_disconnected=client_disconnected,
+                    )
 
         response = StreamingResponse(
             relay(),
@@ -220,7 +240,7 @@ def create_app(settings: Settings, upstream_transport: Any = None) -> Any:
 
 def parse_args(argv: Optional[list[str]] = None) -> Settings:
     parser = argparse.ArgumentParser(
-        description="透明转发 Anthropic API，并完整保存每次请求、响应和流式事件"
+        description="透明转发 Anthropic/OpenAI API，并完整保存每次请求、响应和流式事件"
     )
     parser.add_argument(
         "--listen-host",
@@ -251,6 +271,12 @@ def parse_args(argv: Optional[list[str]] = None) -> Settings:
         default=float(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "300")),
         help="连接/写入超时；流式读取不设置总超时",
     )
+    parser.add_argument("--capture-buffer-bytes", type=int,
+        default=int(os.getenv("CAPTURE_BUFFER_BYTES", str(8 * 1024 * 1024))),
+        help="每条后台采集的字节积压上限，默认 8 MiB；超限停止该条采集并继续转发")
+    parser.add_argument("--capture-max-pending", type=int,
+        default=int(os.getenv("CAPTURE_MAX_PENDING", "64")),
+        help="后台采集任务上限，默认 64；超限跳过采集并继续转发")
     args = parser.parse_args(argv)
     return Settings(
         listen_host=args.listen_host,
@@ -258,6 +284,8 @@ def parse_args(argv: Optional[list[str]] = None) -> Settings:
         upstream_url=args.upstream_url,
         log_dir=args.log_dir,
         timeout_seconds=args.timeout_seconds,
+        capture_buffer_bytes=args.capture_buffer_bytes,
+        capture_max_pending=args.capture_max_pending,
     )
 
 

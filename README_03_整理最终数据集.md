@@ -2,7 +2,7 @@
 
 [上一步：运行 Harbor](README_02_运行_Harbor.md) · [返回总览](README.md) · [下一步：导出 ShareGPT](README_04_导出_ShareGPT.md)
 
-等单个 task 或整个 Harbor run 完成并保存 Claude Code session 后，根据输入目录布局选择下面四个脚本之一。输出目录必须不存在或为空，防止旧轮次残留导致数据混合。
+等单个 task 或整个 Harbor run 完成并保存客户端原生会话、等待后台采集完成后，根据输入目录布局选择下面四个脚本之一。输出目录必须不存在或为空，防止旧轮次残留导致数据混合。
 
 ## 选择整理脚本
 
@@ -12,6 +12,39 @@
 | 无 `tasks/` 中间层的 Harbor jobs 目录 | `finalize-harbor.py` |
 | `node/worker` 目录 | `finalize-node.py` |
 | 单个 `proc_n/<group>/<task_id>` 目录，每个任务内有 `result.json` | `finalize-proc-split.py` |
+
+## Kimi / Hermes 会话整理
+
+所有整理入口默认 `--client cc`，原有 Claude Code 行为保持一致。
+Kimi 和 Hermes 显式指定会话格式；独立客户端使用 `finalize.py --session-dir`：
+
+```bash
+python finalize.py --client kimi \
+  --capture-dir ./capture_logs/kimi_run \
+  --session-dir "$HOME/.kimi-code/sessions" \
+  --output-dir ./dataset_output/kimi_run
+
+python finalize.py --client hermes \
+  --capture-dir ./capture_logs/hermes_run \
+  --session-dir "$HOME/.hermes/state.db" \
+  --output-dir ./dataset_output/hermes_run
+```
+
+会话目录需按实际版本/profile 配置传入。Kimi 用 Wire 响应 ID 或完整历史，Hermes
+以只读 SQLite 事务匹配历史与响应，均拒绝有歧义的候选。独立 sessions 数据没有任务
+目录时以 session/lineage 根 ID 作为 task ID；不会根据 prompt 猜任务名。
+
+`finalize-harbor.py`、`finalize-node.py`、`finalize-node-split.py`、
+`finalize-proc-split.py` 也接受 `--client kimi|hermes`，仍用 `--harbor-run-dir`
+指定原有布局根目录，成功/失败筛选规则不变。会话文件须归档到对应任务日志路径，
+具体布局见 [客户端接入说明](README_07_Kimi_Code与Hermes.md#harbor--node--proc-布局)。
+
+原生压缩摘要归到 `subagent_acompact-kimi-*` / `subagent_acompact-hermes-*`。
+这是压缩操作的导出分组；Hermes 因压缩创建的后继 session 仍归主 agent，
+同一 message_uid 的复制不会伪造额外模型轮次。未知改写、缺失或冲突保留在
+unmatched/conflicts，详见[压缩关联规则](README_07_Kimi_Code与Hermes.md#原生-compact-与恢复导出)。
+
+以下各方案的 Claude Code session 搜索说明适用于默认 `--client cc`。
 
 ## 方案 A：标准 Harbor 目录
 

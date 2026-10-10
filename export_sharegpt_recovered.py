@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 import export_sharegpt as base
 from capture_core import write_json
+from api_protocols import ANTHROPIC, CHAT, RESPONSES, infer_protocol, normalize_round
 
 COMBINED_JSONL_NAME = "sharegpt.jsonl"
 
@@ -75,6 +76,9 @@ def load_source_round(round_dir: Path, number: int) -> SourceRound:
     )
     response_message = base.require_dict(
         response.get("message"), f"{response_path} 的 message"
+    )
+    request_body, response_message = normalize_round(
+        request_body, response_message, response.get("transport") or {}
     )
     base.require_list(
         request_body.get("messages"), f"{request_path} 的 body.json.messages"
@@ -333,6 +337,10 @@ def load_agent_rounds_with_recovery(
             historical_content is not None
             and base.remove_nonsemantic_fields(original_content)
             != base.remove_nonsemantic_fields(historical_content)
+            # 原生客户端会修剪文本、省略思考或改写工具 ID。完整捕获是事实源，
+            # 保留它并由上下文连续性检查切分样本，不用重放历史覆盖模型输出。
+            and (source.response.get("association") or {}).get("client") not in {"kimi", "hermes"}
+            and not history_omits_only_reasoning(source, historical_content)
         ):
             validate_convertible_assistant_content(
                 historical_content,
@@ -372,6 +380,26 @@ def load_agent_rounds_with_recovery(
     if not rounds:
         raise ValueError(f"agent 的所有 round 都被不完整重试替代: {agent_dir}")
     return rounds, recoveries
+
+
+def history_omits_only_reasoning(source: SourceRound, historical_content: Any) -> bool:
+    """保留完整响应；历史省略 reasoning 或 Hermes 修剪文本不表示捕获错误。"""
+    protocol = (source.response.get("transport") or {}).get("api_protocol") or infer_protocol(
+        source.request_body, source.response.get("message")
+    )
+    original = source.response_message.get("content")
+    client = (source.response.get("association") or {}).get("client")
+    supported_projection = protocol in {CHAT, RESPONSES} or protocol == ANTHROPIC and client == "kimi"
+    if not supported_projection or not isinstance(original, list) or not isinstance(historical_content, list):
+        return False
+    comparable = original
+    if not any(b.get("type") == "thinking" for b in historical_content):
+        comparable = [b for b in original if b.get("type") != "thinking"]
+    if client == "hermes":
+        from session_adapters import hermes_storage_content
+        comparable = hermes_storage_content(comparable)
+        historical_content = hermes_storage_content(historical_content)
+    return base.remove_nonsemantic_fields(comparable) == base.remove_nonsemantic_fields(historical_content)
 
 
 def is_compact_agent_dir(agent_dir: Path) -> bool:
