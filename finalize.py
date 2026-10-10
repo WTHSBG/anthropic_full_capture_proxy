@@ -26,6 +26,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
+from api_protocols import request_protocol
+
 from capture_core import (
     SCHEMA_VERSION,
     body_representation,
@@ -116,7 +118,7 @@ def select_output_parts(
 
 @dataclass
 class SessionLocation:
-    message_id: str
+    message_id: Optional[str]
     task_id: str
     task_dir: str
     harbor_agent_id: Optional[str]
@@ -133,6 +135,8 @@ class SessionLocation:
     # Claude Code 的自动压缩会把同一个 assistant 事件同时写入主 session 和
     # agent-acompact-*.jsonl。该内部字段只用于识别这种镜像，不写入最终 association。
     fragment_identities: set[str] = field(default_factory=set, repr=False)
+    client: Optional[str] = None
+    association_method: str = "message_id"
 
     def semantic_key(self) -> tuple[str, str, str, str]:
         return (
@@ -143,7 +147,7 @@ class SessionLocation:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "message_id": self.message_id,
             "task_id": self.task_id,
             "task_dir": self.task_dir,
@@ -159,6 +163,9 @@ class SessionLocation:
             "source_files": sorted(set(self.source_files or [self.session_file])),
             "fragment_count": self.fragment_count,
         }
+        if self.client:
+            value.update(client=self.client, association_method=self.association_method)
+        return value
 
 
 @dataclass(frozen=True)
@@ -593,9 +600,9 @@ def capture_is_messages_request(capture: CaptureRecord) -> bool:
 
     if bool(capture.request.get("is_messages_request")):
         return True
-    return is_messages_request_path(
+    return request_protocol(
         capture.request.get("method"), capture.request.get("path")
-    )
+    ) is not None
 
 
 def capture_request_body(capture: CaptureRecord) -> Optional[dict[str, Any]]:
@@ -1040,6 +1047,7 @@ def finalize_dataset(
     task_output_group_resolver: Optional[Callable[[SessionLocation], str]] = None,
     request_output_parts: Optional[list[str]] = None,
     response_output_parts: Optional[list[str]] = None,
+    client: str = "cc",
 ) -> dict[str, Any]:
     """执行关联、分类、round 排序和最终文件写出。
 
@@ -1084,18 +1092,28 @@ def finalize_dataset(
         SUPPORTED_FINAL_RESPONSE_PARTS,
         "response.json",
     )
+    if client not in {"cc", "kimi", "hermes"}:
+        raise ValueError(f"不支持的客户端: {client}")
+    captures, inflight_count = load_captures(capture_root)
+    client_associations = {}
+    client_ambiguity = {}
+    if client != "cc":
+        from session_adapters import build_client_associations
+        client_associations, session_stats, client_ambiguity = build_client_associations(
+            captures, harbor_root, client, session_files=session_files,
+            task_context_resolver=task_context_resolver,
+        )
     ensure_empty_output(output_root)
     files_to_scan = (
-        sorted(session_files)
-        if session_files is not None
-        else discover_session_files(harbor_root)
-    )
-    session_index, session_conflicts, session_stats = build_session_index(
+        sorted(session_files) if session_files is not None else discover_session_files(harbor_root)
+    ) if client == "cc" else []
+    session_index, session_conflicts, cc_session_stats = build_session_index(
         harbor_root,
         session_files=files_to_scan,
         task_context_resolver=task_context_resolver,
     )
-    captures, inflight_count = load_captures(capture_root)
+    if client == "cc":
+        session_stats = cc_session_stats
 
     captures_by_message: dict[str, list[CaptureRecord]] = {}
     for capture in captures:
@@ -1129,11 +1147,12 @@ def finalize_dataset(
     for capture in captures:
         message_id = capture.message_id
         is_messages = capture_is_messages_request(capture)
-        if not message_id:
+        adapter_candidates = client_associations.get(capture.capture_id, [])
+        if not message_id and not adapter_candidates:
             (unmatched if is_messages else auxiliary).append(capture)
             continue
         normal_location = session_index.get(message_id)
-        candidates = session_conflicts.get(message_id, [])
+        candidates = adapter_candidates if client != "cc" else session_conflicts.get(message_id, [])
         if normal_location is None and not candidates:
             normal_location = compact_recovery_index.get(message_id)
         if candidates and location_filter is not None:
@@ -1152,7 +1171,7 @@ def finalize_dataset(
             filtered_count += 1
             continue
 
-        if message_id in duplicate_capture_ids or len(candidates) > 1:
+        if message_id in duplicate_capture_ids or len(candidates) > 1 or capture.capture_id in client_ambiguity:
             conflict_records.append((capture, candidates))
             continue
 
@@ -1296,6 +1315,8 @@ def finalize_dataset(
                 "duplicate_capture_count": len(
                     captures_by_message.get(capture.message_id or "", [])
                 ),
+                **({"association_conflict_reason": client_ambiguity[capture.capture_id]}
+                   if capture.capture_id in client_ambiguity else {}),
             },
         )
 
@@ -1314,7 +1335,7 @@ def finalize_dataset(
         "filtered_captures": filtered_count,
         "inflight": inflight_count,
         "tasks": len(task_summary),
-        "session_message_ids": len(session_index),
+        "session_message_ids": len(session_index) if client == "cc" else session_stats.get("wire_message_ids", 0),
         "session_conflict_ids": len(session_conflicts),
         "duplicate_capture_message_ids": len(duplicate_capture_ids),
         "session_scan": session_stats,
@@ -1322,13 +1343,15 @@ def finalize_dataset(
     }
     if task_output_group_resolver is not None:
         report["task_output_groups"] = output_group_counts
+    if client != "cc":
+        report["client"] = client
     write_json(output_root / "finalization_report.json", report)
     return report
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="把代理原始数据与 Harbor/Claude Code session 关联并生成最终数据集"
+        description="关联 Claude Code、Kimi Code 或 Hermes 会话并生成最终数据集"
     )
     parser.add_argument(
         "--capture-dir",
@@ -1337,10 +1360,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="proxy.py 的 --log-dir，或其 raw 子目录",
     )
     parser.add_argument(
-        "--harbor-run-dir",
+        "--harbor-run-dir", "--session-dir",
         type=Path,
         required=True,
-        help="Harbor run 目录、tasks 目录或单个 task 目录",
+        help="CC/Harbor 日志目录、Kimi sessions 目录或 Hermes state.db",
+    )
+    parser.add_argument(
+        "--client", choices=("cc", "kimi", "hermes"), default="cc",
+        help="会话格式，默认 cc；Kimi/Hermes 用 --session-dir 指定会话数据",
     )
     parser.add_argument(
         "--output-dir",
@@ -1357,6 +1384,7 @@ def main() -> None:
         capture_root=args.capture_dir,
         harbor_root=args.harbor_run_dir,
         output_root=args.output_dir,
+        client=args.client,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

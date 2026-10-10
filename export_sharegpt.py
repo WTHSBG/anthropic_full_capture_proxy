@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from capture_core import write_json
+from api_protocols import normalize_round
 
 
 ROUND_DIRECTORY_PATTERN = re.compile(r"^round_(\d+)$")
@@ -109,6 +110,10 @@ def validate_completed_response(response: dict[str, Any], path: Path) -> None:
         raise IncompleteResponseError(
             f"SSE 聚合未完成，不能用于 SFT: {path}", path, details
         )
+    if isinstance(transport, dict) and transport.get("aggregation_errors"):
+        raise IncompleteResponseError(
+            f"SSE 聚合存在错误，不能用于 SFT: {path}", path, details
+        )
 
 
 def load_round(round_dir: Path, number: int) -> RoundRecord:
@@ -122,6 +127,9 @@ def load_round(round_dir: Path, number: int) -> RoundRecord:
     request_body = require_dict(body.get("json"), f"{request_path} 的 body.json")
     response_message = require_dict(
         response.get("message"), f"{response_path} 的 message"
+    )
+    request_body, response_message = normalize_round(
+        request_body, response_message, response.get("transport") or {}
     )
     require_list(request_body.get("messages"), f"{request_path} 的 body.json.messages")
     require_list(response_message.get("content"), f"{response_path} 的 message.content")

@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from api_protocols import CHAT, RESPONSES, ChatCompletionAggregator, ResponsesAggregator, request_protocol
+
 
 SCHEMA_VERSION = 1
 SENSITIVE_REQUEST_HEADERS = {
@@ -309,7 +311,7 @@ class SSEDecoder:
     SSE event。因此 feed() 只按换行拆行，直到空行才 dispatch 完整事件。
     """
 
-    def __init__(self, aggregator: AnthropicMessageAggregator) -> None:
+    def __init__(self, aggregator: Any) -> None:
         self.aggregator = aggregator
         self._buffer = b""
         self._event_name: Optional[str] = None
@@ -371,7 +373,16 @@ class SSEDecoder:
             except json.JSONDecodeError:
                 payload = None
         if isinstance(payload, dict):
-            self.aggregator.consume(payload)
+            try:
+                self.aggregator.consume(payload)
+            except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                # 上游结构异常只影响离线聚合，不中断原始 SSE 转发。
+                self.aggregator.errors.append(f"SSE 事件结构错误: {type(exc).__name__}: {exc}")
+        elif data_text == "[DONE]":
+            if hasattr(self.aggregator, "mark_done"):
+                self.aggregator.mark_done()
+        elif data_text:
+            self.aggregator.errors.append("SSE data 不是合法 JSON")
 
         self.event_count += 1
         record: dict[str, Any] = {
@@ -456,6 +467,8 @@ class RequestCapture:
             "body_json": request_json,
             "client": {"host": client_host, "port": client_port},
             "is_messages_request": is_messages_request_path(method, path),
+            "api_protocol": request_protocol(method, path),
+            "is_inference_request": request_protocol(method, path) is not None,
         }
         write_json(self.paths.inflight_dir / "request.json", self.request_record)
         write_json(
@@ -486,11 +499,15 @@ class RequestCapture:
             "request_id": extract_header_value(headers, "request-id"),
             "stream": is_sse,
             "source": source,
+            "api_protocol": self.request_record.get("api_protocol"),
         }
         self._response_content_encoding = extract_header_value(headers, "content-encoding")
         self._response_handle = (self.paths.inflight_dir / "response.body").open("wb")
         if is_sse:
-            self._decoder = SSEDecoder(AnthropicMessageAggregator())
+            protocol = self.request_record.get("api_protocol")
+            aggregator = (ChatCompletionAggregator() if protocol == CHAT else
+                          ResponsesAggregator() if protocol == RESPONSES else AnthropicMessageAggregator())
+            self._decoder = SSEDecoder(aggregator)
             self._defer_sse_decode = bool(
                 self._response_content_encoding
                 and self._response_content_encoding.lower().strip() != "identity"
@@ -573,7 +590,10 @@ class RequestCapture:
         elif isinstance(non_stream_json, dict) and isinstance(non_stream_json.get("id"), str):
             message_id = non_stream_json["id"]
 
-        aggregation_complete = bool(aggregator and aggregator.complete)
+        aggregation_complete = bool(aggregator and aggregator.complete and not aggregator.errors)
+        # SDK 通常在协议结束标记后主动关闭连接，不等待上游 HTTP EOF。
+        # 已验证完整的 SSE 不因此变成残缺；保留断开和错误信息供审计。
+        disconnect_after_complete = bool(client_disconnected and aggregation_complete)
         self.response_record.update(
             {
                 "finished_at": utc_timestamp(),
@@ -592,13 +612,25 @@ class RequestCapture:
                 "sse_event_count": self._decoder.event_count if self._decoder is not None else 0,
                 "transport_error": transport_error,
                 "client_disconnected": client_disconnected,
+                "disconnect_after_complete": disconnect_after_complete,
             }
         )
         write_json(self.paths.inflight_dir / "response.json", self.response_record)
 
-        if transport_error:
+        if transport_error and not disconnect_after_complete:
             state = "partial"
-        elif aggregator is not None and not aggregator.complete:
+        elif aggregator is not None and not aggregation_complete:
+            state = "partial"
+        elif decoding_error:
+            state = "partial"
+        elif aggregator is None and self.request_record.get("api_protocol") == RESPONSES and (
+            not non_stream_json or non_stream_json.get("status") != "completed"
+        ):
+            state = "partial"
+        elif aggregator is None and self.request_record.get("api_protocol") == CHAT and (
+            not non_stream_json or not non_stream_json.get("choices")
+            or any(c.get("finish_reason") is None for c in non_stream_json["choices"])
+        ):
             state = "partial"
         else:
             state = "complete"
@@ -612,10 +644,34 @@ class RequestCapture:
                 "message_id": message_id,
                 "transport_error": transport_error,
                 "client_disconnected": client_disconnected,
+                "disconnect_after_complete": disconnect_after_complete,
             },
         )
         self.paths.completed_dir.parent.mkdir(parents=True, exist_ok=True)
         os.replace(self.paths.inflight_dir, self.paths.completed_dir)
+
+    def fail_capture(self, error: str) -> None:
+        """采集自身失败时关闭句柄，尽力写入 partial，绝不将残缺采集发布为完整轮次。"""
+        self._finalized = True
+        for name in ("_response_handle", "_events_handle"):
+            handle = getattr(self, name)
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+                setattr(self, name, None)
+        directory = self.paths.completed_dir if self.paths.completed_dir.exists() else self.paths.inflight_dir
+        if not directory.exists():
+            return
+        # 磁盘错误可能阻止任何写入；保留 inflight 与原始前缀，由健康接口报告故障。
+        write_json(directory / "state.json", {
+            "schema_version": SCHEMA_VERSION, "capture_id": self.capture_id,
+            "state": "partial", "capture_error": error, "updated_at": utc_timestamp(),
+        })
+        if self.response_record:
+            self.response_record.update(capture_error=error, aggregation_complete=False)
+            write_json(directory / "response.json", self.response_record)
 
     def abandon(self, error: str) -> None:
         """仅在尚未形成响应时使用，仍把请求移入 completed 供后处理审计。"""

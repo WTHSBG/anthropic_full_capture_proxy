@@ -6,3 +6,5 @@ sharegpt_output/
 dataset_output/
 shili/
 .test_tmp/
+validation/
+.DS_Store

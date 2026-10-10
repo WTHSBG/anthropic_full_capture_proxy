@@ -41,6 +41,29 @@ python export_sharegpt_recovered.py \
 
 恢复版复用严格导出器的 ShareGPT 格式、上下文切分、reasoning 模式和工具调用校验，并额外生成 `recovery_report.json`。该报告逐条记录 task、agent、被处理的 round、恢复动作以及作为证据的下一 round；无法安全恢复的不完整响应仍按严格导出器的方式写入 `export_errors.json`，其他结构错误仍会直接终止导出。
 
+## Kimi / Hermes 与压缩轨迹
+
+两个通用导出器支持 Anthropic Messages、OpenAI Chat Completions 和 Responses。
+finalizer 保留原生 response 结构；导出时才在内存中规范化为公共消息和工具格式，
+原始 HTTP 文件不被改写。Kimi/Hermes 都可使用上述 `--input-dir` / `--output-dir`，
+导出器从 association / transport 判断客户端和协议，不需要再指定 `--client`。
+
+Kimi/Hermes 的完整响应始终以捕获为准。客户端后续历史修剪空白、省略 reasoning、
+补单空格占位或改写工具 ID 时，不用该历史覆盖原始模型输出；必要时切分为多个样本。
+工具参数、原始可见 reasoning 和工具结果分别保留。因此一个用户任务可能导出多条
+JSONL 样本，每条是实际请求上下文及对应响应，不能把条数当成独立任务数。
+
+压缩 mask 是**恢复版**的默认行为：压缩样本除最后一条 assistant 外，之前所有
+assistant 改成 `masked_assistant`，最后一条摘要保留 `assistant`；system/user/tool
+不改。下游需按该角色屏蔽历史回复的 loss，文件没有自动生成 token 级 `loss_mask`。
+Hermes 的原生摘要输入把历史打包进 user 提示时，没有独立的历史 assistant 要 mask。
+严格版导出不会执行该恢复版专用 mask，需此规则时使用 `export_sharegpt_recovered.py`。
+
+当前训练导出支持文本、可见 reasoning 和 function 工具。多 choice、非文本内容、
+非 function 内置工具、仅加密 reasoning 和通过 `previous_response_id` 隐藏历史的
+Responses 请求会拒绝导出，原始 capture 仍保留。协议终止事件及完整性要求见
+[客户端接入文档](README_07_Kimi_Code与Hermes.md#导出与保证范围)。
+
 ## 恢复版的证据和边界
 
 恢复版不是根据残缺 SSE 猜测缺失内容，只执行以下有事实证据支持的操作：
@@ -60,7 +83,7 @@ python export_sharegpt_recovered.py \
 
 每个 ShareGPT 文件使用 UTF-8 紧凑单行 JSON，与 `shili/sharegpt.json` 一致；
 文件末尾保留一个换行符。缩进和换行只影响文件展示，不改变 JSON 数据结构。
-修改位置在export_sharegpt的652 compact=True/False
+独立 JSON 使用紧凑格式，合并的 `sharegpt.jsonl` 每行保存一个完整样本。
 
 ## 输出结构
 

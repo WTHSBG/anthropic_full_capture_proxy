@@ -19,6 +19,7 @@ from typing import Callable, Optional
 
 from capture_core import write_json
 from finalize import SessionLocation, finalize_dataset
+from session_adapters import client_task_context, discover_session_sources
 
 
 # request.json 完整支持的顶层字段只有下面 6 个。此列表同时是实际输出白名单：
@@ -279,12 +280,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="只转换按 print_result.py 规则判定为 correct 的 task 轨迹",
     )
+    parser.add_argument("--client", choices=("cc", "kimi", "hermes"), default="cc", help="会话客户端格式，默认 cc")
     return parser.parse_args(argv)
 
 
 def main() -> None:
     args = parse_args()
-    session_files = discover_node_session_files(args.harbor_run_dir)
+    session_files = (discover_node_session_files(args.harbor_run_dir) if args.client == "cc"
+                     else discover_session_sources(args.harbor_run_dir, args.client))
     result_logs = discover_result_logs(args.harbor_run_dir)
     successful_dirs = successful_task_directories(args.harbor_run_dir, result_logs)
     location_filter = (
@@ -298,7 +301,9 @@ def main() -> None:
         harbor_root=args.harbor_run_dir,
         output_root=args.output_dir,
         session_files=session_files,
-        task_context_resolver=node_task_context,
+        task_context_resolver=(node_task_context if args.client == "cc" else
+                               lambda path, root: client_task_context(path, root, "node")),
+        client=args.client,
         location_filter=location_filter,
         # 显式传入本文件的白名单，使 finalize-node.py 可以独立控制输出字段。
         request_output_parts=FINAL_REQUEST_PARTS,
