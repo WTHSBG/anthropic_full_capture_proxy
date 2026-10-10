@@ -65,7 +65,7 @@ export_sharegpt.py / export_sharegpt_recovered.py
 python -m unittest discover -s tests -v
 ```
 
-95 项自动化测试覆盖原有 Claude Code 路径、新客户端关联/导出、compact、采集故障和自动归档。
+112 项自动化测试覆盖原有 Claude Code 路径、新客户端关联/导出、compact、采集故障和自动归档。
 真实 Kimi/Hermes 文件工具及原生压缩已另行验收；受测版本和范围见
 [验收说明](tests/ACCEPTANCE.md)。文本、可见 reasoning 和 function 工具可导出；
 未知协议内容、缺失会话和非唯一证据保持未关联或拒绝有损导出。

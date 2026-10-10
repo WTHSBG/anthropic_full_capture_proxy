@@ -17,9 +17,40 @@ import time
 import uuid
 from datetime import datetime, timezone
 from contextlib import closing
+from itertools import chain
 from pathlib import Path, PurePosixPath
 
 from capture_core import utc_timestamp
+
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+CLEANUP_DIRECTORY = ".archive-cleanup"
+
+
+def encode_manifest(manifest: dict) -> bytes:
+    return json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode()
+
+
+def sync_directory(path: Path) -> None:
+    if os.name == "posix":
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def files_by_capture(manifest: dict) -> dict:
+    captures = {}
+    for name, entry in manifest["files"].items():
+        captures.setdefault(member_name(name), {})[name] = entry
+    return captures
+
+
+def record_failure(result: dict, stage: str, error: Exception, capture_id: str) -> None:
+    result["failures"] += 1
+    result["last_failure"] = {"stage": stage, "error_type": type(error).__name__,
+        "capture_id": capture_id if re.fullmatch(r"[A-Za-z0-9_-]+", capture_id) else None,
+        "at": utc_timestamp()}
 
 
 def digest_file(path: Path) -> str:
@@ -44,7 +75,7 @@ def member_name(name: str) -> str:
     return parts[1]
 
 
-def snapshot(directory: Path) -> dict:
+def snapshot(directory: Path, *, allow_empty=False) -> dict:
     if directory.is_symlink() or not directory.is_dir():
         raise ValueError("capture 必须是普通目录")
     files = {}
@@ -60,7 +91,7 @@ def snapshot(directory: Path) -> dict:
                 after.st_size, after.st_mtime_ns, after.st_ino):
             raise ValueError("capture 在读取期间变化")
         files[name] = {"size": after.st_size, "sha256": digest}
-    if not files:
+    if not files and not allow_empty:
         raise ValueError("capture 为空")
     return files
 
@@ -69,7 +100,7 @@ def verify_archive(path: Path) -> dict:
     """逐文件读回并校验，不信任 tar 路径、链接或清单内容。"""
     with tarfile.open(path, "r:gz") as archive:
         first = archive.next()
-        if first is None or first.name != "manifest.json" or not first.isfile() or first.size > 4 * 1024 * 1024:
+        if first is None or first.name != "manifest.json" or not first.isfile() or first.size > MAX_MANIFEST_BYTES:
             raise ValueError("归档缺少有效清单")
         manifest = json.load(archive.extractfile(first))
         if manifest.get("schema_version") != 1 or not isinstance(manifest.get("files"), dict):
@@ -104,21 +135,24 @@ def verify_archive(path: Path) -> dict:
         return manifest
 
 
-def write_archive(root: Path, destination: Path, captures: list[Path]) -> dict:
-    files = {}
-    for directory in captures:
-        files.update(snapshot(directory))
-    manifest = {"schema_version": 1, "created_at": utc_timestamp(),
-                "source_root": str(root.resolve()), "files": files}
+def write_archive(root: Path, destination: Path, captures: list[Path], *, manifest=None) -> dict:
+    if manifest is None:
+        files = {}
+        for directory in captures:
+            files.update(snapshot(directory))
+        manifest = {"schema_version": 1, "created_at": utc_timestamp(),
+                    "source_root": str(root.resolve()), "files": files}
+    payload = encode_manifest(manifest)
+    if len(payload) > MAX_MANIFEST_BYTES:
+        raise ValueError("归档清单超过大小上限")
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     try:
         with tarfile.open(temporary, "w:gz", compresslevel=6) as archive:
-            payload = json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode()
             info = tarfile.TarInfo("manifest.json")
             info.size = len(payload)
             info.mode = 0o600
             archive.addfile(info, io.BytesIO(payload))
-            for name in files:
+            for name in manifest["files"]:
                 archive.add(root / name, arcname=name, recursive=False)
         if verify_archive(temporary) != manifest:
             raise ValueError("归档清单读回不一致")
@@ -126,30 +160,47 @@ def write_archive(root: Path, destination: Path, captures: list[Path]) -> dict:
             os.fsync(handle.fileno())
         os.replace(temporary, destination)
         # 目录项也落盘，然后才能写索引和清理源文件。
-        if os.name == "posix":
-            fd = os.open(destination.parent, os.O_RDONLY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+        sync_directory(destination.parent)
         return manifest
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def remove_verified(directory: Path, manifest: dict) -> None:
-    expected = {name: entry for name, entry in manifest["files"].items()
-                if member_name(name) == directory.name}
-    if snapshot(directory) != expected:
+def remove_verified(directory: Path, manifest: dict, *, allow_partial=False) -> None:
+    expected = manifest["files"]
+    actual = snapshot(directory, allow_empty=allow_partial)
+    matches = (all(expected.get(name) == entry for name, entry in actual.items())
+               if allow_partial else actual == expected)
+    if not expected or not matches:
         raise ValueError("源 capture 与归档不一致，保留源文件")
+    # 先原子移出 completed。中断后，残余文件不依赖已删除的 state.json，
+    # 下一轮根据持久化索引和仍可完整校验的归档，校验剩余文件后继续清理。
+    if directory.parent.name != CLEANUP_DIRECTORY:
+        cleanup = directory.parent.parent / CLEANUP_DIRECTORY
+        cleanup.mkdir(exist_ok=True)
+        if cleanup.is_symlink():
+            raise ValueError("清理目录不能是符号链接")
+        sync_directory(cleanup.parent)
+        destination = cleanup / directory.name
+        if destination.exists():
+            raise FileExistsError("清理区已有同名 capture")
+        previous = directory.parent
+        os.rename(directory, destination)
+        directory = destination
+        sync_directory(previous)
+        sync_directory(cleanup)
     shutil.rmtree(directory)
+    sync_directory(directory.parent)
 
 
 def archive_completed(root: Path, archive_dir: Path, *, min_age_seconds: float,
                       batch_size: int, delete_source: bool, excluded_ids=()) -> dict:
-    """每次最多归档一个批次。索引持久化后才允许删除；失败保留源数据。"""
-    result = {"archived_captures": 0, "removed_captures": 0, "archive_bytes": 0}
-    if not (root / "completed").exists():
+    """总条数受批量限制，清单按字节分包；单条故障不会中断其它 capture。"""
+    result = {"archived_captures": 0, "removed_captures": 0, "archive_bytes": 0,
+              "failures": 0, "last_failure": None}
+    completed = root / "completed"
+    cleanup = root / CLEANUP_DIRECTORY
+    if not completed.exists() and not cleanup.exists():
         return result
     archive_dir.mkdir(parents=True, exist_ok=True)
     source = str(root.resolve())
@@ -157,60 +208,152 @@ def archive_completed(root: Path, archive_dir: Path, *, min_age_seconds: float,
     with closing(sqlite3.connect(archive_dir / "index.sqlite3", timeout=0)) as index, index:
         index.execute("CREATE TABLE IF NOT EXISTS archives (archive TEXT PRIMARY KEY, manifest TEXT)")
         index.execute("CREATE TABLE IF NOT EXISTS captures (source TEXT, capture TEXT, archive TEXT, PRIMARY KEY(source, capture))")
-        # 同一归档目录的调度器串行处理，避免重复创建批次。
         index.execute("BEGIN IMMEDIATE")
+        # 已归档记录只查询路径；仅在清理或修复旧包时加载一次整包清单。
+        indexed, indexed_manifests, verified = {}, {}, {}
+
+        def indexed_files(relative):
+            if relative not in indexed:
+                row = index.execute("SELECT manifest FROM archives WHERE archive=?", (relative,)).fetchone()
+                if row is None:
+                    raise ValueError("归档索引缺少清单")
+                indexed_manifests[relative] = json.loads(row[0])
+                indexed[relative] = files_by_capture(indexed_manifests[relative])
+            return indexed[relative]
+
+        def verified_files(relative):
+            if relative not in verified:
+                try:
+                    manifest = verify_archive(archive_dir / relative)
+                    indexed_files(relative)
+                    if manifest != indexed_manifests[relative]:
+                        raise ValueError("归档与持久化索引不一致")
+                    verified[relative] = files_by_capture(manifest)
+                except Exception as exc:
+                    # 失败也缓存，避免同包的每条 capture 重复解压坏包。
+                    verified[relative] = exc
+            value = verified[relative]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
         candidates = []
-        verified = {}
-        for directory in (root / "completed").iterdir():
-            if directory.name in excluded:
+        cleanup_items = ()
+        if delete_source and cleanup.exists():
+            if cleanup.is_symlink():
+                raise ValueError("清理目录不能是符号链接")
+            cleanup_items = cleanup.iterdir()
+        directories = chain(cleanup_items, completed.iterdir() if completed.exists() else ())
+        template = {"schema_version": 1, "created_at": utc_timestamp(),
+                    "source_root": source, "files": {}}
+        base_size = len(encode_manifest(template))
+        for directory in directories:
+            if directory.name in excluded or directory.is_symlink() or not directory.is_dir():
                 continue
-            if directory.is_symlink() or not directory.is_dir():
-                continue
-            state = json.loads((directory / "state.json").read_text())
-            if state.get("state") not in {"complete", "partial"}:
-                continue
-            ended = datetime.fromisoformat(state["updated_at"].replace("Z", "+00:00")).timestamp()
-            if time.time() - ended < min_age_seconds:
-                continue
-            old = index.execute("SELECT c.archive, a.manifest FROM captures c JOIN archives a ON c.archive=a.archive WHERE c.source=? AND c.capture=?",
-                                (source, directory.name)).fetchone()
-            if old:
-                old_path = archive_dir / old[0]
-                if old_path.is_file():
-                    if delete_source:
-                        if old[0] not in verified:
-                            verified[old[0]] = verify_archive(old_path)
-                        if verified[old[0]] != json.loads(old[1]):
-                            raise ValueError("归档与持久化索引不一致")
-                        remove_verified(directory, verified[old[0]])
-                        result["removed_captures"] += 1
-                        if result["removed_captures"] >= batch_size:
-                            break
+            phase = "inspect"
+            try:
+                old = index.execute("SELECT archive FROM captures WHERE source=? AND capture=?",
+                                    (source, directory.name)).fetchone()
+                if old:
+                    old_path = archive_dir / old[0]
+                    if not delete_source and old_path.is_file():
+                        continue
+                    expected = indexed_files(old[0]).get(directory.name)
+                    if not expected:
+                        raise ValueError("索引缺少 capture 文件")
+                    phase = "verify_existing"
+                    try:
+                        archived = verified_files(old[0])[directory.name]
+                    except Exception as exc:
+                        record_failure(result, phase, exc, directory.name)
+                        # 完整原件与旧清单一致时可以重新归档；残缺原件必须保留。
+                        if snapshot(directory) != expected:
+                            raise ValueError("旧包不可用且原件不完整，保留残余文件")
+                    else:
+                        if delete_source:
+                            phase = "cleanup"
+                            remove_verified(directory, {"files": archived}, allow_partial=True)
+                            result["removed_captures"] += 1
+                            if len(candidates) + result["removed_captures"] >= batch_size:
+                                break
+                        continue
+                elif directory.parent == cleanup:
+                    raise ValueError("清理残余没有持久化归档索引")
+                phase = "inspect"
+                state = json.loads((directory / "state.json").read_text())
+                if state.get("state") not in {"complete", "partial"}:
                     continue
-            candidates.append(directory)
-            if len(candidates) + result["removed_captures"] >= batch_size:
-                break
+                ended = datetime.fromisoformat(state["updated_at"].replace("Z", "+00:00")).timestamp()
+                if time.time() - ended < min_age_seconds:
+                    continue
+                phase = "snapshot"
+                files = snapshot(directory)
+                # 每条只序列化自己的成员；合并时只有逗号开销，无平方级清单编码。
+                cost = len(encode_manifest(files)) - 2
+                if base_size + cost > MAX_MANIFEST_BYTES:
+                    raise ValueError("单条 capture 清单超过大小上限")
+                candidates.append((directory, files, cost))
+                if len(candidates) + result["removed_captures"] >= batch_size:
+                    break
+            except Exception as exc:
+                record_failure(result, phase, exc, directory.name)
+
         if not candidates:
             return result
-        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        folder = archive_dir / day
+        folder = archive_dir / datetime.now(timezone.utc).strftime("%Y-%m-%d")
         folder.mkdir(parents=True, exist_ok=True)
-        destination = folder / f"captures-{uuid.uuid4().hex}.tar.gz"
-        manifest = write_archive(root, destination, candidates)
-        relative = str(destination.relative_to(archive_dir))
-        encoded = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))
-        index.execute("INSERT INTO archives VALUES (?, ?)", (relative, encoded))
-        index.executemany("INSERT OR REPLACE INTO captures VALUES (?, ?, ?)",
-                          [(source, p.name, relative) for p in candidates])
-        index.commit()
-        result["archived_captures"] = len(candidates)
-        result["archive_bytes"] = destination.stat().st_size
-        if delete_source:
-            # 接续持有索引锁；提交已完成，即便删除中断下次也能校验后重试。
+        sync_directory(archive_dir)
+
+        def publish(batch):
+            manifest = {**template, "files": {}}
+            for _, files, _ in batch:
+                manifest["files"].update(files)
+            destination = folder / f"captures-{uuid.uuid4().hex}.tar.gz"
+            try:
+                write_archive(root, destination, [p for p, _, _ in batch], manifest=manifest)
+            except Exception as exc:
+                # 读取期间单条变化/读盘失败也要隔离；缩小批次定位故障。
+                if len(batch) > 1:
+                    middle = len(batch) // 2
+                    publish(batch[:middle])
+                    publish(batch[middle:])
+                else:
+                    record_failure(result, "write", exc, batch[0][0].name)
+                return
+            relative = str(destination.relative_to(archive_dir))
+            try:
+                index.execute("INSERT INTO archives VALUES (?, ?)", (relative, encode_manifest(manifest).decode()))
+                index.executemany("INSERT OR REPLACE INTO captures VALUES (?, ?, ?)",
+                                  [(source, p.name, relative) for p, _, _ in batch])
+                index.commit()
+            except Exception as exc:
+                index.rollback()
+                for directory, _, _ in batch:
+                    record_failure(result, "index", exc, directory.name)
+                index.execute("BEGIN IMMEDIATE")
+                return
+            # 重新持锁后才能清理。包和索引均已持久化，发布后失败的重复包可去重恢复。
             index.execute("BEGIN IMMEDIATE")
-            for directory in candidates:
-                remove_verified(directory, manifest)
-                result["removed_captures"] += 1
+            result["archived_captures"] += len(batch)
+            result["archive_bytes"] += destination.stat().st_size
+            if delete_source:
+                for directory, files, _ in batch:
+                    try:
+                        remove_verified(directory, {"files": files})
+                        result["removed_captures"] += 1
+                    except Exception as exc:
+                        record_failure(result, "cleanup", exc, directory.name)
+
+        batch, payload_size = [], base_size
+        for item in candidates:
+            cost = item[2] + (1 if batch else 0)
+            if payload_size + cost > MAX_MANIFEST_BYTES:
+                publish(batch)
+                batch, payload_size, cost = [], base_size, item[2]
+            batch.append(item)
+            payload_size += cost
+        if batch:
+            publish(batch)
     return result
 
 
@@ -246,8 +389,11 @@ class ArchiveManager:
                 result = await asyncio.to_thread(archive_completed, self.root, self.archive_dir,
                     min_age_seconds=self.min_age_seconds, batch_size=self.batch_size,
                     delete_source=self.delete_source, excluded_ids=self.active_ids())
-                for key, value in result.items():
-                    self.totals[key] += value
+                for key in self.totals:
+                    self.totals[key] += result[key]
+                self.failures += result.get("failures", 0)
+                if result.get("last_failure"):
+                    self.last_failure = result["last_failure"]
             except Exception as exc:
                 self.failure("archive", exc)
             finally:
@@ -282,20 +428,25 @@ def restore_archives(archives: list[Path], output: Path) -> int:
     if output.is_symlink() or (output.exists() and (not output.is_dir() or any(output.iterdir()))):
         raise FileExistsError("恢复输出目录须不存在或为空")
     manifests = [verify_archive(path) for path in archives]
-    ids = set()
+    captures = {}
     for manifest in manifests:
-        batch = {member_name(name) for name in manifest["files"]}
-        if ids & batch or any((output / "completed" / value).exists() for value in batch):
-            raise FileExistsError("恢复 capture 已存在；请使用新的输出目录")
-        ids.update(batch)
+        for identifier, files in files_by_capture(manifest).items():
+            if identifier in captures and captures[identifier] != files:
+                raise ValueError("重复 capture 的文件清单冲突")
+            captures[identifier] = files
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".capture-restore-", dir=output.parent) as temporary:
         stage = Path(temporary)
         for path, manifest in zip(archives, manifests):
             with tarfile.open(path, "r:gz") as archive:
+                first = archive.next()
+                if (first is None or first.name != "manifest.json" or not first.isfile()
+                        or first.size > MAX_MANIFEST_BYTES
+                        or json.load(archive.extractfile(first)) != manifest):
+                    raise ValueError("恢复时归档清单发生变化")
                 seen = set()
                 for member in archive:
-                    if member.name == "manifest.json":
+                    if member is first:
                         continue
                     member_name(member.name)
                     if not member.isfile() or member.name in seen or member.name not in manifest["files"]:
@@ -303,20 +454,28 @@ def restore_archives(archives: list[Path], output: Path) -> int:
                     seen.add(member.name)
                     destination = stage / member.name
                     destination.parent.mkdir(parents=True, exist_ok=True)
-                    with destination.open("xb") as handle:
-                        shutil.copyfileobj(archive.extractfile(member), handle)
                     entry = manifest["files"][member.name]
-                    if destination.stat().st_size != entry["size"] or digest_file(destination) != entry["sha256"]:
+                    if member.size != entry["size"]:
+                        raise ValueError("恢复时文件大小不匹配")
+                    with archive.extractfile(member) as handle:
+                        if destination.exists():
+                            # 完整清单一致的重复仍读回校验，不能静默忽略坏包。
+                            digest = digest_stream(handle)
+                        else:
+                            with destination.open("xb") as target:
+                                shutil.copyfileobj(handle, target)
+                            digest = digest_file(destination)
+                    if destination.stat().st_size != entry["size"] or digest != entry["sha256"]:
                         raise ValueError("恢复时哈希不匹配")
                 if seen != set(manifest["files"]):
                     raise ValueError("恢复时归档缺失文件")
         (output / "completed").mkdir(parents=True, exist_ok=True)
-        for value in ids:
+        for value in captures:
             destination = output / "completed" / value
             if destination.exists():
                 raise FileExistsError("恢复目录出现同名 capture")
             os.rename(stage / "completed" / value, destination)
-    return len(ids)
+    return len(captures)
 
 
 def main():
