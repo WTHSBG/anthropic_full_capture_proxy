@@ -24,6 +24,17 @@ Claude Code 默认按 session `message.id` 关联；Kimi 优先使用 Wire 响�
 7. [Kimi Code 与 Hermes 接入](README_07_Kimi_Code与Hermes.md)
 8. [自动归档与恢复](README_08_自动归档.md)
 
+## 独立扩展入口
+
+| 入口 | 功能与说明 | 当前支持边界 |
+| --- | --- | --- |
+| [proxy_lb.py](README_proxy_lb.md) | 多后端轮询或随机分配 | 独立转发实现，后台采集隔离和自动归档尚未接入 |
+| [proxy_retry.py](README_proxy_retry.md) | 完整接收、校验后回放，失败自动重试 | 模型重试面向 Messages；Chat Completions/Responses 重试、后台采集隔离和自动归档尚未接入 |
+| [export_sharegpt_recovered_merged.py](README_export_sharegpt_recovered_merged.md) | 合并 compact 样本、过滤截断监督目标及按 CC session 分类超限失败 | Hermes/OpenAI 格式尚未接入；成功合并后历史 assistant 参与训练 |
+
+上述入口可独立选择。下述工作流程及自动归档配置使用 `proxy.py`。
+`proxy_retry.py` 的失败尝试保存在 `raw/retry_attempts/`，需要单独安排保存和清理。
+
 ## 工作流程
 
 ```text
@@ -65,11 +76,12 @@ export_sharegpt.py / export_sharegpt_recovered.py
 python -m unittest discover -s tests -v
 ```
 
-112 项自动化测试覆盖原有 Claude Code 路径、新客户端关联/导出、compact、采集故障和自动归档。
+167 项自动化测试覆盖原有 Claude Code 路径、新客户端关联/导出、compact、采集故障、
+自动归档及上游新增的负载均衡、缓存重试与合并导出。各独立入口的支持边界见上表。
 真实 Kimi/Hermes 文件工具及原生压缩已另行验收；受测版本和范围见
 [验收说明](tests/ACCEPTANCE.md)。文本、可见 reasoning 和 function 工具可导出；
 未知协议内容、缺失会话和非唯一证据保持未关联或拒绝有损导出。
 
-压缩样本需历史 assistant mask 时使用恢复版导出器：最后一条摘要仍为 assistant，
+压缩样本需保留原有历史 assistant mask 规则时，使用 `export_sharegpt_recovered.py`：最后一条摘要仍为 assistant，
 此前 assistant 标为 masked_assistant；具体训练字段与规则见
 [导出说明](README_04_导出_ShareGPT.md#kimi--hermes-与压缩轨迹)。

@@ -5,8 +5,9 @@
 
 ## 自动化测试
 
-`python -m unittest discover -s tests -v`：112 项通过，包含原有 Claude Code / Harbor
-测试和新增协议、会话适配、compact、透明转发、采集故障及自动归档测试。无需模型凭据或外网。
+`python -m unittest discover -s tests -v`：167 项通过，包含原有 Claude Code / Harbor
+测试和新增协议、会话适配、compact、透明转发、采集故障、自动归档，以及上游负载均衡、
+缓存重试与合并导出测试。无需模型凭据或外网。
 真实 TCP 用例仅连接本机。
 
 ## 真实服务与客户端
@@ -68,3 +69,18 @@ capture 的全部文件哈希一致，33 条恢复导出样本逐条 JSON 一致
 Kimi 增加三项会话回归：Wire ID 与 context 历史不能让两个 HTTP 响应认领同一轮，
 capture 顺序不影响结果，其他会话/轮次仍可回退关联；ID 已确认的 partial capture
 也能占用其完整原生答案对应的轮次。未接受的同文本重试进入 conflicts。
+
+## 2026-11-02 上游同步
+
+合并上游 `main` 的 `b4e0874`，包含 `proxy_lb.py`、`proxy_retry.py` 和
+`export_sharegpt_recovered_merged.py` 等 11 个新增文件，保留各独立入口。
+上游原版 91 项测试、组合后的 167 项测试均通过。
+
+额外兼容性检查使用已保留的真实数据，不调用模型服务：新合并导出器可以导出四组
+Kimi 数据；五组 Hermes 数据因缺少 OpenAI 格式规范化，在读取 message.content 时失败。
+Kimi 手动 compact 合并后历史 assistant 参与训练，区别于原恢复导出器的独立压缩样本 mask。
+
+本机故障注入还确认：设置额外重试一次时，Messages 断流尝试两次，Chat Completions
+和 Responses 各尝试一次；两个新代理入口的采集 start_request 出现 OSError 时均返回
+HTTP 500，health 未提供 archive 状态。这些是本次同步保留的支持边界，后续可独立适配。
+`raw/retry_attempts/` 的失败尝试也需要另行归档；现有自动归档仍处理 `proxy.py` 的采集。
