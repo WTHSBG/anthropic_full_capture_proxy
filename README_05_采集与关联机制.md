@@ -56,13 +56,18 @@ Claude Code 普通请求不使用相邻时间、客户端 IP 或 prompt 内容�
 
 - HTTP 请求是 Messages 路径且状态完整
 - `x-claude-code-session-id` 与主 session 完全一致
-- 最后一条 user message 包含 Claude Code 专用 compact 指令
+- 跳过末尾仅含已知运行时元数据（如 `<total_tokens>`）的 system 消息后，最后一条 user message 包含 Claude Code 专用 compact 指令
 - 主 session 存在 `compact_boundary` 及其 `isCompactSummary` synthetic user message
 - HTTP 响应完成时间与边界相邻
 - 响应 `<summary>` 正文完整出现在 synthetic message 中
 - capture 与边界是一对一唯一匹配
 
 全部满足后，最终数据集中会创建 `subagent_acompact-recovered-<boundary_uuid>`；它不会修改或伪造源目录中的 `subagents/*.jsonl`。任何证据缺失、冲突或多义时仍进入 `unmatched`。恢复统计写入 `finalization_report.json.compact_recovery`。
+
+新式 CC 会话可用 `compactMetadata.preservedSegment.anchorUuid` 指向摘要记录自身的 `uuid`，
+摘要的 `parentUuid` 可以指向中间 attachment。存在唯一 anchor 时优先使用该关联；旧式
+`parentUuid == boundary.uuid` 仍兼容。多个边界共用一个 anchor 时拒绝猜测，session、
+时间、摘要正文及一对一匹配条件仍须全部通过。
 
 ## OpenAI 协议和原生客户端关联
 

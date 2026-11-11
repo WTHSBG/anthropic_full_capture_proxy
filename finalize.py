@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
-from api_protocols import request_protocol
+from api_protocols import is_cc_runtime_system_message, request_protocol
 
 from capture_core import (
     SCHEMA_VERSION,
@@ -670,7 +670,11 @@ def compact_capture_evidence(
     messages = body.get("messages") if isinstance(body, dict) else None
     if not isinstance(messages, list) or not messages:
         return None
-    last_message = messages[-1]
+    # 新式 CC 可在 compact prompt 后追加仅含运行时统计的 system 消息。
+    last_index = len(messages) - 1
+    while last_index >= 0 and is_cc_runtime_system_message(messages[last_index]):
+        last_index -= 1
+    last_message = messages[last_index] if last_index >= 0 else None
     if not isinstance(last_message, dict) or last_message.get("role") != "user":
         return None
     prompt = content_text(last_message.get("content"))
@@ -723,6 +727,8 @@ def discover_compact_boundaries(
         if task_dir not in agent_id_cache:
             agent_id_cache[task_dir] = find_harbor_agent_id(task_dir)
         pending: dict[str, tuple[str, str, int]] = {}
+        # 新式摘要的 parentUuid 可指向 attachment；anchorUuid 直接指向摘要 uuid。
+        pending_anchors: dict[str, set[str]] = {}
 
         for line_number, record in jsonl_records(session_file):
             if (
@@ -752,6 +758,11 @@ def discover_compact_boundaries(
                         boundary_timestamp,
                         line_number,
                     )
+                    metadata = record.get("compactMetadata")
+                    preserved = metadata.get("preservedSegment") if isinstance(metadata, dict) else None
+                    anchor = preserved.get("anchorUuid") if isinstance(preserved, dict) else None
+                    if isinstance(anchor, str) and anchor:
+                        pending_anchors.setdefault(anchor, set()).add(boundary_uuid)
                 continue
 
             if record.get("type") != "user" or not (
@@ -760,7 +771,12 @@ def discover_compact_boundaries(
             ):
                 continue
             parent_uuid = record.get("parentUuid") or record.get("parent_uuid")
-            if not isinstance(parent_uuid, str) or parent_uuid not in pending:
+            record_uuid = record.get("uuid")
+            anchors = pending_anchors.get(record_uuid, set()) if isinstance(record_uuid, str) else set()
+            if len(anchors) > 1:
+                continue
+            boundary_uuid = next(iter(anchors)) if anchors else parent_uuid
+            if not isinstance(boundary_uuid, str) or boundary_uuid not in pending:
                 continue
             message = record.get("message")
             if not isinstance(message, dict) or message.get("role") != "user":
@@ -769,7 +785,7 @@ def discover_compact_boundaries(
             if not all(marker in synthetic_text for marker in COMPACT_SYNTHETIC_MARKERS):
                 continue
 
-            session_id, boundary_timestamp, boundary_line = pending[parent_uuid]
+            session_id, boundary_timestamp, boundary_line = pending[boundary_uuid]
             synthetic_session_id = record.get("sessionId") or record.get("session_id")
             if (
                 isinstance(synthetic_session_id, str)
@@ -783,7 +799,7 @@ def discover_compact_boundaries(
                 task_dir=str(task_dir.resolve()),
                 harbor_agent_id=agent_id_cache[task_dir],
                 session_id=session_id,
-                boundary_uuid=parent_uuid,
+                boundary_uuid=boundary_uuid,
                 boundary_timestamp=boundary_timestamp,
                 boundary_line=boundary_line,
                 session_file=session_file_value,

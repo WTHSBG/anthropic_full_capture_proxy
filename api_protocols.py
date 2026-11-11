@@ -3,11 +3,94 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from typing import Any, Optional
 
 ANTHROPIC = "anthropic_messages"
 CHAT = "openai_chat"
 RESPONSES = "openai_responses"
+TOTAL_TOKENS_PATTERN = re.compile(r"<total_tokens>.*?</total_tokens>", re.IGNORECASE | re.DOTALL)
+BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
+
+
+def clean_cc_system_text(text: str) -> str:
+    """只清理 system 里的已知 CC 运行时元数据；普通文本保留原有空白。"""
+    if text.lstrip().startswith(BILLING_HEADER_PREFIX):
+        return ""
+    if TOTAL_TOKENS_PATTERN.search(text):
+        return TOTAL_TOKENS_PATTERN.sub("", text).strip()
+    return text
+
+
+def clean_cc_system_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return clean_cc_system_text(content)
+    if not isinstance(content, list):
+        return copy.deepcopy(content)
+    result = []
+    for block in content:
+        cleaned = copy.deepcopy(block)
+        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+            text = clean_cc_system_text(block["text"])
+            if not text and text != block["text"]:
+                continue
+            cleaned["text"] = text
+        result.append(cleaned)
+    return result
+
+
+def is_cc_runtime_system_message(message: Any) -> bool:
+    if not isinstance(message, dict) or message.get("role") != "system":
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content.strip()) and not clean_cc_system_text(content)
+    if isinstance(content, list) and content:
+        return all(isinstance(block, dict) and block.get("type") == "text"
+                   and isinstance(block.get("text"), str) for block in content) and (
+            any(block["text"].strip() for block in content)
+            and not any(clean_cc_system_text(block["text"]).strip() for block in content))
+    return False
+
+
+def normalize_cc_request(body: dict[str, Any]) -> dict[str, Any]:
+    """离线处理 CC system 注入，不把历史中途的真实指令迁移到开头。"""
+    result = copy.deepcopy(body)
+    if "system" in result:
+        result["system"] = clean_cc_system_content(result["system"])
+    messages = result.get("messages")
+    if not isinstance(messages, list):
+        return result
+    history, leading = [], []
+    for message in messages:
+        if is_cc_runtime_system_message(message):
+            continue
+        if isinstance(message, dict) and message.get("role") == "system":
+            content = clean_cc_system_content(message.get("content", ""))
+            if history:
+                # 保留真实指令的位置，由导出器既有角色策略决定是否支持。
+                message["content"] = content
+                history.append(message)
+                continue
+            if isinstance(content, str):
+                leading.append({"type": "text", "text": content})
+            elif isinstance(content, list):
+                leading.extend(content)
+            else:
+                raise ValueError("system 消息 content 必须是字符串或列表")
+        else:
+            history.append(message)
+    if leading:
+        system = result.get("system")
+        if system is None:
+            system = []
+        if isinstance(system, str):
+            system = [{"type": "text", "text": system}] if system else []
+        if not isinstance(system, list):
+            raise ValueError("system 必须是字符串或列表")
+        result["system"] = system + leading
+    result["messages"] = history
+    return result
 
 
 def request_protocol(method: Any, path: Any) -> Optional[str]:
@@ -25,6 +108,10 @@ def infer_protocol(body: dict[str, Any], message: Optional[dict[str, Any]] = Non
         return RESPONSES
     if message and "choices" in message:
         return CHAT
+    # 旧采集可能没有 api_protocol；Anthropic 响应比 messages 中的 system 注入更可靠。
+    if message and (message.get("type") == "message" or (
+            message.get("role") == "assistant" and isinstance(message.get("content"), list))):
+        return ANTHROPIC
     if any(m.get("role") in {"system", "developer", "tool"} or "tool_calls" in m
            for m in body.get("messages", []) if isinstance(m, dict)):
         return CHAT
@@ -251,7 +338,7 @@ def responses_messages(items: Any) -> list[dict[str, Any]]:
 
 def normalize_request(body: dict[str, Any], protocol: str) -> dict[str, Any]:
     if protocol == ANTHROPIC:
-        return copy.deepcopy(body)
+        return normalize_cc_request(body)
     result = copy.deepcopy(body)
     if protocol == RESPONSES:
         if body.get("previous_response_id"):

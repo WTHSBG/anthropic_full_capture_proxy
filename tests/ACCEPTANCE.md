@@ -5,7 +5,7 @@
 
 ## 自动化测试
 
-`python -m unittest discover -s tests -v`：167 项通过，包含原有 Claude Code / Harbor
+`python -m unittest discover -s tests -v`：180 项通过，包含原有 Claude Code / Harbor
 测试和新增协议、会话适配、compact、透明转发、采集故障、自动归档，以及上游负载均衡、
 缓存重试与合并导出测试。无需模型凭据或外网。
 真实 TCP 用例仅连接本机。
@@ -84,3 +84,19 @@ Kimi 手动 compact 合并后历史 assistant 参与训练，区别于原恢复�
 和 Responses 各尝试一次；两个新代理入口的采集 start_request 出现 OSError 时均返回
 HTTP 500，health 未提供 archive 状态。这些是本次同步保留的支持边界，后续可独立适配。
 `raw/retry_attempts/` 的失败尝试也需要另行归档；现有自动归档仍处理 `proxy.py` 的采集。
+
+## 2026-11-11 CC 格式兼容
+
+从离线工具包选择性移植 CC compact 及 system 元数据兼容，新增 13 项回归测试。
+覆盖请求末尾 total_tokens system 注入、anchorUuid/attachment 摘要关联、旧式 parentUuid、
+重复 anchor 拒绝、session 检查，以及恢复后导出 compact mask 的完整链路。
+严格版、恢复版和合并恢复版均验证元数据清理；保留普通 system 空白和 user/assistant 正文，
+历史中途的真实 system 指令仍拒绝前移。旧采集缺少 api_protocol 时可根据 Anthropic 响应识别协议。
+
+保留原有上下文连续性切分规则，未采用工具包“只在 CC 英文压缩标记处切分”的策略；
+原有切分、防歧义、compact mask、非文本拒绝及 Kimi/Hermes 测试全部通过。
+71 条真实 compact capture 副本归档恢复后文件哈希一致，33 条 compact 与 8 条普通
+样本重新导出逐条 JSON 一致。原始证据未修改。
+
+本轮使用构造的新格式 CC 记录及已保留的真实 Kimi/Hermes 数据，没有新增模型调用，
+没有用新版 CC CLI 重跑真实服务。新代理入口和合并导出器的其它支持边界见上节。

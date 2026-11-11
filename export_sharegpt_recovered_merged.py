@@ -84,6 +84,7 @@ def load_source_round(round_dir: Path, number: int) -> SourceRound:
     response_message = base.require_dict(
         response.get("message"), f"{response_path} 的 message"
     )
+    request_body = base.normalize_cc_request(request_body)
     base.require_list(
         request_body.get("messages"), f"{request_path} 的 body.json.messages"
     )

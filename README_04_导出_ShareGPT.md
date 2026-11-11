@@ -97,6 +97,12 @@ sharegpt_output/run_20260803/
 
 同一个 agent 的相邻 round 在 model、实质 system 和消息历史连续时合并；billing cch、`cache_control`、thinking `signature` 以及字符串/单个 text block 的等价表示不会误触发切分。当新请求只增加工具、且已有工具定义未变时，仍属于同一上下文，最终文件使用 segment 最后一轮的工具全集。发生真正的上下文压缩、历史替换、system/model 变化、工具删除或已有工具定义改变时，从该 round 开始生成下一个文件。
 
+CC 的 system 中 `<total_tokens>…</total_tokens>` 运行时统计会在离线导出时清理，
+包含字符串及 text block 表示。messages 中只含这些统计的 system 消息可忽略；
+开头的 system 指令可与顶层 system 合并，历史中途的真实 system 指令仍拒绝迁移。
+user/assistant 正文和普通 system 的空白保持原样，原始 HTTP 文件也保持原样。
+严格版、恢复版及合并恢复版共用这项兼容处理，切分和 compact mask 规则继续按各入口执行。
+
 ## 工具调用兼容格式
 
 工具调用同时包含两套等价字段：
