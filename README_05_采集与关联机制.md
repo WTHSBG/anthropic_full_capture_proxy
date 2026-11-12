@@ -56,7 +56,10 @@ Messages 请求识别兼容标准 `POST /v1/messages` 及网关添加前缀后�
 
 新式会话还支持 `compactMetadata.preservedSegment.anchorUuid` 指向摘要记录自身的 `uuid`，
 其 `parentUuid` 可以指向中间 attachment；旧式 parentUuid 直接对应边界 uuid 继续兼容。
-该行为来自工具包 finalize.py，仍要求 session、时间、摘要正文及一对一证据成立。
+该关联在工具包 finalize.py 基础上实现，仍要求 session、时间、摘要正文及一对一证据成立。
+实测中模型可能在前导 `<analysis>` 内引用 `<summary>`。提取实际摘要前仅排除完整的前导
+analysis，保留摘要正文自身的字面标签和全部文本；仅在分析里出现的示例摘要不作为恢复证据。
+此处理只用于关联校验，原始 HTTP 响应及导出内容不改写。
 
 ## 保证范围
 

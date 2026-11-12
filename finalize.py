@@ -697,6 +697,10 @@ def compact_capture_evidence(
     ):
         return None
     response_text = content_text(message.get("content"))
+    # 分析中可能引用 <summary>，不能把它当成真正摘要的起点；
+    # 只排除完整的前导 analysis，保留摘要正文里的字面标签和全部内容。
+    response_text = re.sub(r"^\s*<analysis>.*?</analysis>\s*", "", response_text,
+                           count=1, flags=re.DOTALL)
     summary_matches = COMPACT_SUMMARY_PATTERN.findall(response_text)
     if len(summary_matches) != 1:
         return None

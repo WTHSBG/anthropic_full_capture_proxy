@@ -155,3 +155,35 @@ class CanonicalExportTests(unittest.TestCase):
         self.assertEqual(exported[0]["messages"][-2]["content"], "")
         self.assertEqual(report["masked_assistant_messages"], 1)
         self.assertEqual({p: p.read_bytes() for p in before}, before)
+
+    def test_compact_summary_ignores_analysis_tag_mentions_and_keeps_full_body(self):
+        helper = fixtures.FinalizerTests()
+        captures, harbor = self.root / "captures", self.root / "harbor"
+        summary = ("Actual summary retains facts and a literal <summary> mention in its body. " * 8).strip()
+        prompt = ("CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
+                  "Your task is to create a detailed summary of the conversation so far.\n<summary>")
+        response = ("<analysis>Output a <summary> block. An example is <summary>example</summary>."
+                    "Keep the actual summary after this analysis.</analysis>\n<summary>" + summary + "</summary>")
+        helper._write_unindexed_capture(captures, "cap_compact", "msg_compact", session_id="s",
+            prompt=prompt, response_text=response)
+        helper._write_compact_boundary_session(harbor, session_id="s", summary=summary)
+        from finalize import load_captures, compact_capture_evidence
+        captured, _ = load_captures(captures)
+        evidence = compact_capture_evidence(captured[0])
+        self.assertIsNotNone(evidence)
+        self.assertEqual(evidence.response_summary, summary)
+        report = finalize_dataset(captures, harbor, self.root / "dataset")
+        self.assertEqual((report["matched"], report["unmatched"]), (1, 0))
+        self.assertEqual(report["compact_recovery"]["recovered_associations"], 1)
+
+    def test_summary_quoted_only_inside_analysis_is_not_recovered(self):
+        helper = fixtures.FinalizerTests()
+        captures, harbor = self.root / "captures", self.root / "harbor"
+        summary = "This is only an analysis example and not an actual generated summary. " * 8
+        prompt = ("CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
+                  "Your task is to create a detailed summary of the conversation so far.\n<summary>")
+        helper._write_unindexed_capture(captures, "cap_compact", "msg_compact", session_id="s",
+            prompt=prompt, response_text="<analysis>Example: <summary>" + summary + "</summary></analysis>")
+        helper._write_compact_boundary_session(harbor, session_id="s", summary=summary)
+        report = finalize_dataset(captures, harbor, self.root / "dataset")
+        self.assertEqual((report["matched"], report["unmatched"]), (0, 1))

@@ -69,6 +69,11 @@ python run_canonical_export.py \
 被后续历史移除的早期内容不保证单独保留。含图段会裁到首图之前，裁剪数量写入运行报告。
 嵌入式 system 消息保留相对位置；成功合并 compact 后，历史 assistant 参与训练。
 
-`python -m unittest discover -s tests -v`：98 项通过，验收范围见 [tests/ACCEPTANCE.md](tests/ACCEPTANCE.md)。
+`python -m unittest discover -s tests -v`：100 项通过，验收范围见 [tests/ACCEPTANCE.md](tests/ACCEPTANCE.md)。
 导出器及采集核心文件保持工具包原始字节；修改四个被锁定依赖后，canonical 入口会拒绝运行，
 更新代码时须同步校验清单和入口指纹。图片裁剪由 canonical 入口安装，直接调用其它导出器的行为见各自文档。
+
+已用 Claude Code 2.1.322 和配置的 Sonnet 服务完成真实 CLI 验收：对话、Read/Write/Edit、
+原生手动 compact、压缩后记忆与工具操作；12条 HTTP 请求全部关联，导出3条样本。
+实测修复了前导 analysis 中引用 summary 标签导致摘要关联失败的问题，详见
+[验收说明](tests/ACCEPTANCE.md)。原始日志和轨迹保留在测试者本地。

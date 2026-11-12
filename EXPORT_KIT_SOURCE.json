@@ -3,7 +3,7 @@
   "archive_sha256": "dfc5e4370663ecc939745fed811112feffaae6b3251d3102add6bcb9760ca972",
   "upstream": "https://github.com/yida12345/anthropic_full_capture_proxy",
   "upstream_commit": "b4e0874e5ebd5d605831e01dbe97446e52ec78e4",
-  "integration": "canonical-export 中的代码和指纹文件放到仓库根目录，代码文件保持与工具包逐字节一致；文档按本仓库布局更新。",
+  "integration": "canonical-export 代码和指纹文件平铺到仓库根目录；导出与采集脚本保持原包字节。finalize.py 基于原包修复实测摘要关联问题，原始及当前指纹分别记录。",
   "files": {
     "capture_core.py": {
       "source": "canonical-export/capture_core.py",
@@ -31,7 +31,9 @@
     },
     "finalize.py": {
       "source": "finalize.py",
-      "sha256": "598a535cb9997722a696ba42ca853bfeb60eac549f4b2a1d7c860bdf02b9f34a"
+      "sha256": "2c773ca107bf76d1c3c1e8d89d72873f2baf08faabf22edfec62fd4506fbd7bd",
+      "original_sha256": "598a535cb9997722a696ba42ca853bfeb60eac549f4b2a1d7c860bdf02b9f34a",
+      "local_patch": "真实 CC 2.1.322 验收发现前导 analysis 内的 summary 标签引用干扰提取；排除前导 analysis 后保留完整摘要正文。"
     }
   }
 }
