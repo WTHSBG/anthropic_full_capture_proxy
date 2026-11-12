@@ -116,11 +116,15 @@ class MergedExporterTests(unittest.TestCase):
         self.assertEqual(records[0]["tools"][0]["name"], "Read")
 
     def test_ambiguous_main_prefix_is_not_guessed(self):
-        self.pair()
-        directory = self.add_round("main_agent", 2, [user("question")], assistant("answer")["content"])
-        request = json.loads((directory / "request.json").read_text())
-        request["body"]["json"]["temperature"] = 0.5
-        write_json(directory / "request.json", request)
+        # 工具包只按压缩重启分段；在两个实际窗口中构造相同的最长前缀，
+        # 继续验证合并器面对多义证据不会随意选择。
+        marker = "This session is being continued from a previous conversation. Summary: state"
+        history = [user(marker), assistant("previous"), user("question")]
+        self.add_round("main_agent", 1, history, assistant("answer")["content"])
+        self.add_round("main_agent", 2, [user(marker)], assistant("restart")["content"])
+        self.add_round("main_agent", 3, history, assistant("answer")["content"])
+        self.add_round("subagent_acompact-auto", 1,
+                       history + [assistant("answer"), user("summarize")], assistant("summary")["content"])
         _, report, records, audit = self.export()
         self.assertEqual(report["merged_compacts"], 0)
         self.assertEqual(len(records), 3)
@@ -153,7 +157,8 @@ class MergedExporterTests(unittest.TestCase):
         self.add_round("main_agent", 2, history, thought(), stop="max_tokens")
         self.add_round("main_agent", 3, history + [user("output limit, continue")], assistant("done")["content"])
         _, report, records, _ = self.export()
-        self.assertEqual(report["original_context_splits"], 1)
+        # 此处没有原生压缩边界，工具包窗口策略不因删除截断轮次而额外切段。
+        self.assertEqual(report["original_context_splits"], 0)
         self.assertEqual(report["context_splits"], 0)
         self.assertEqual(report["discarded_truncated_rounds"], 1)
         self.assertEqual(len(records), 1)

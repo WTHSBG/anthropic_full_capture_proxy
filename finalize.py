@@ -15,6 +15,15 @@ from __future__ import annotations
 补充路径用于 Claude Code 未写出 ``agent-acompact-*.jsonl`` 的自动压缩响应：只有
 Messages 路径、session header、专用 compact prompt、compact_boundary、紧邻时间及
 响应摘要正文全部一致时，才恢复为 acompact 子 agent；证据不唯一时仍保持 unmatched。
+
+Claude Code 2.1.283 起有两处格式变化，本文件的压缩恢复路径已同时兼容：
+
+* 压缩请求的 ``messages`` 末尾会附加 ``role=system`` 的 ``<total_tokens>`` 运行
+  时注入，压缩 prompt 位于最后一条 user 消息（检测时从尾部跳过 system 消息）；
+* ``isCompactSummary`` 记录的 ``parentUuid`` 改为指向中间的 attachment 记录，
+  权威配对字段变为 ``compact_boundary.compactMetadata.preservedSegment.anchorUuid``
+  等于 ``isCompactSummary`` 记录自身的 ``uuid``（旧版本的 parentUuid 直连仍作
+  fallback 保留）。
 """
 
 import argparse
@@ -663,7 +672,15 @@ def compact_capture_evidence(
     messages = body.get("messages") if isinstance(body, dict) else None
     if not isinstance(messages, list) or not messages:
         return None
-    last_message = messages[-1]
+    # Claude Code 2.1.283 起会在 messages 末尾附加 role=system 的 <total_tokens>
+    # 运行时注入，压缩 prompt 位于最后一条 user 消息。从尾部跳过 system 消息后，
+    # 老版本（末尾直接是 user）与新版本的请求形态收敛到同一判据。
+    last_index = len(messages) - 1
+    while last_index >= 0 and isinstance(messages[last_index], dict):
+        if messages[last_index].get("role") != "system":
+            break
+        last_index -= 1
+    last_message = messages[last_index] if last_index >= 0 else None
     if not isinstance(last_message, dict) or last_message.get("role") != "user":
         return None
     prompt = content_text(last_message.get("content"))
@@ -715,7 +732,12 @@ def discover_compact_boundaries(
         task_id, task_dir = resolve_task_context(session_file, harbor_root)
         if task_dir not in agent_id_cache:
             agent_id_cache[task_dir] = find_harbor_agent_id(task_dir)
+        # 旧版本 Claude Code：isCompactSummary 记录的 parentUuid 直接等于
+        # compact_boundary.uuid（同一事件层）。2.1.283 起 parentUuid 指向中间的
+        # attachment 记录，官方配对字段改为 boundary.compactMetadata.
+        # preservedSegment.anchorUuid == isCompactSummary 记录自身的 uuid。
         pending: dict[str, tuple[str, str, int]] = {}
+        pending_anchors: dict[str, str] = {}
 
         for line_number, record in jsonl_records(session_file):
             if (
@@ -745,6 +767,13 @@ def discover_compact_boundaries(
                         boundary_timestamp,
                         line_number,
                     )
+                    compact_metadata = record.get("compactMetadata")
+                    if isinstance(compact_metadata, dict):
+                        preserved = compact_metadata.get("preservedSegment")
+                        if isinstance(preserved, dict):
+                            anchor_uuid = preserved.get("anchorUuid")
+                            if isinstance(anchor_uuid, str) and anchor_uuid:
+                                pending_anchors[anchor_uuid] = boundary_uuid
                 continue
 
             if record.get("type") != "user" or not (
@@ -752,8 +781,16 @@ def discover_compact_boundaries(
                 or record.get("is_compact_summary") is True
             ):
                 continue
+            record_uuid = record.get("uuid")
             parent_uuid = record.get("parentUuid") or record.get("parent_uuid")
-            if not isinstance(parent_uuid, str) or parent_uuid not in pending:
+            boundary_uuid: Optional[str] = None
+            if isinstance(record_uuid, str) and record_uuid in pending_anchors:
+                # 2.1.283：anchorUuid 是 boundary 自带的官方指向，优先于 uuid 链。
+                boundary_uuid = pending_anchors[record_uuid]
+            elif isinstance(parent_uuid, str) and parent_uuid in pending:
+                # 旧版本：parentUuid 直接等于 boundary.uuid。
+                boundary_uuid = parent_uuid
+            if boundary_uuid is None:
                 continue
             message = record.get("message")
             if not isinstance(message, dict) or message.get("role") != "user":
@@ -762,7 +799,7 @@ def discover_compact_boundaries(
             if not all(marker in synthetic_text for marker in COMPACT_SYNTHETIC_MARKERS):
                 continue
 
-            session_id, boundary_timestamp, boundary_line = pending[parent_uuid]
+            session_id, boundary_timestamp, boundary_line = pending[boundary_uuid]
             synthetic_session_id = record.get("sessionId") or record.get("session_id")
             if (
                 isinstance(synthetic_session_id, str)
@@ -776,7 +813,7 @@ def discover_compact_boundaries(
                 task_dir=str(task_dir.resolve()),
                 harbor_agent_id=agent_id_cache[task_dir],
                 session_id=session_id,
-                boundary_uuid=parent_uuid,
+                boundary_uuid=boundary_uuid,
                 boundary_timestamp=boundary_timestamp,
                 boundary_line=boundary_line,
                 session_file=session_file_value,

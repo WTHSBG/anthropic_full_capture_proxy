@@ -10,9 +10,10 @@ from __future__ import annotations
 * 示例读取端继续使用对象外层的扁平字段；
 * 标准嵌套字段是事实源，写出前强制检查扁平别名与它完全相同。
 
-同一个 agent 的相邻 round 只有在语义上下文连续时才合并。比较时会忽略每轮都会
-变化但不改变对话语义的 billing cch、cache_control 和 thinking signature，也会
-统一字符串与单个 text block 两种等价表示。工具只新增且旧定义不变时仍视为连续。
+同一个 agent 的相邻 round 只在压缩操作处切分：消息数骤减且新历史首条消息是压缩
+合成摘要（"This session is being continued from a previous conversation"）时开启
+新 segment。微压缩/上下文重写（消息数不减少）、system/model/tools 变化以及注入类
+改写都不再切分，由该段最后一轮的完整请求历史代表整个上下文窗口。
 """
 
 import argparse
@@ -28,6 +29,12 @@ from capture_core import write_json
 
 ROUND_DIRECTORY_PATTERN = re.compile(r"^round_(\d+)$")
 BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
+TOTAL_TOKENS_PATTERN = re.compile(
+    r"<total_tokens>.*?</total_tokens>", re.IGNORECASE | re.DOTALL
+)
+# Claude Code 压缩操作后，重启请求历史的首条消息固定以该文本开头；它与
+# finalize.py 的 COMPACT_SYNTHETIC_MARKERS 保持同一来源语义。
+COMPACT_RESTART_MARKER = "This session is being continued from a previous conversation"
 REASONING_MODES = ("separate", "inline")
 
 
@@ -210,43 +217,65 @@ def normalized_content_for_context(content: Any) -> Any:
     return blocks
 
 
-def normalized_message_for_context(message: Any) -> Any:
-    """清理消息元数据，并统一 user/assistant 的 content 表示。"""
+def clean_system_text(text: str) -> str:
+    """删除不属于训练语义、且会随轮次变化的 system 运行时元数据。"""
 
-    normalized = remove_nonsemantic_fields(message)
-    if not isinstance(normalized, dict):
+    if text.lstrip().startswith(BILLING_HEADER_PREFIX):
+        return ""
+    return TOTAL_TOKENS_PATTERN.sub("", text).strip()
+
+
+def normalized_system_content(content: Any) -> Any:
+    """统一 system 文本的字符串/block 表示，并清除易变运行时元数据。"""
+
+    normalized = normalized_content_for_context(content)
+    if not isinstance(normalized, list):
         return normalized
-    if normalized.get("role") not in {"user", "assistant"}:
-        return normalized
 
-    result = dict(normalized)
-    result["content"] = normalized_content_for_context(result.get("content", ""))
-    return result
-
-
-def normalized_system(system: Any) -> Any:
-    """删除每轮 cch 都会变化的内部 billing header，再进行语义规范化。"""
-
-    if isinstance(system, str):
-        return (
-            []
-            if system.lstrip().startswith(BILLING_HEADER_PREFIX)
-            else normalized_content_for_context(system)
-        )
-    if system is None:
-        return []
-    blocks = require_list(system, "request.system")
     kept: list[Any] = []
-    for block in blocks:
+    for block in normalized:
         if (
             isinstance(block, dict)
             and block.get("type") == "text"
             and isinstance(block.get("text"), str)
-            and block["text"].lstrip().startswith(BILLING_HEADER_PREFIX)
         ):
-            continue
-        kept.append(block)
-    return normalized_content_for_context(kept)
+            text = clean_system_text(block["text"])
+            if not text:
+                continue
+            cleaned_block = dict(block)
+            cleaned_block["text"] = text
+            kept.append(cleaned_block)
+        else:
+            kept.append(block)
+    return kept
+
+
+def normalized_message_for_context(message: Any) -> Any:
+    """清理消息元数据，并统一 user/assistant/system 的 content 表示。"""
+
+    normalized = remove_nonsemantic_fields(message)
+    if not isinstance(normalized, dict):
+        return normalized
+    role = normalized.get("role")
+    if role not in {"user", "assistant", "system"}:
+        return normalized
+
+    result = dict(normalized)
+    if role == "system":
+        result["content"] = normalized_system_content(result.get("content", ""))
+    else:
+        result["content"] = normalized_content_for_context(result.get("content", ""))
+    return result
+
+
+def normalized_system(system: Any) -> Any:
+    """删除易变运行时元数据，再进行 system 语义规范化。"""
+
+    if system is None:
+        return []
+    if not isinstance(system, str):
+        require_list(system, "request.system")
+    return normalized_system_content(system)
 
 
 def normalized_messages(messages: Any) -> list[Any]:
@@ -293,6 +322,9 @@ def tools_context_compatible(previous_tools: Any, current_tools: Any) -> bool:
 def context_continues(previous: RoundRecord, current: RoundRecord) -> bool:
     """判断 current 是否是 previous 的同一语义上下文继续增长。
 
+    这是逐对连续性的诊断谓词，不再驱动 split_rounds_by_context 的切分；切分
+    现在只发生在压缩重启处（见 is_compaction_restart）。
+
     model/system 必须一致；tools 可以只新增，但所有旧工具必须保留且定义不变。
     current.messages 必须保留 previous.messages 的完整规范化前缀，并紧接着包含
     previous response 的 assistant content。
@@ -324,15 +356,64 @@ def context_continues(previous: RoundRecord, current: RoundRecord) -> bool:
     return new_messages[len(old_messages)] == expected_assistant
 
 
+def message_text(message: Any) -> str:
+    """取消息 content 的可见文本（字符串或 text block 列表）。"""
+
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and isinstance(block.get("text"), str):
+            parts.append(block["text"])
+    return "\n".join(parts)
+
+
+def is_compaction_restart(previous: RoundRecord, current: RoundRecord) -> bool:
+    """判断 current 是否是一次压缩操作后的重启请求。
+
+    判据（缺一不可）：
+    1. current 的消息数严格少于 previous 的消息数（压缩必然丢弃大部分历史）；
+    2. current 历史的首条消息是压缩合成摘要（包含 "This session is being
+       continued from a previous conversation"）。
+
+    微压缩/上下文重写（消息数不减少）、system/model/tools 变化、注入类改写都
+    不满足该判据，因此不会被误切成新段。
+    """
+
+    previous_messages = previous.request_body.get("messages")
+    current_messages = current.request_body.get("messages")
+    if not isinstance(previous_messages, list) or not isinstance(
+        current_messages, list
+    ):
+        return False
+    if len(current_messages) >= len(previous_messages):
+        return False
+    if not current_messages:
+        return False
+    return COMPACT_RESTART_MARKER in message_text(current_messages[0])
+
+
 def split_rounds_by_context(rounds: list[RoundRecord]) -> list[list[RoundRecord]]:
+    """按压缩操作把 round 序列切分为上下文窗口。
+
+    段边界只出现在压缩重启处（is_compaction_restart）。每段代表 agent 的一个
+    上下文窗口；段的 ShareGPT 记录由该段最后一轮的完整请求历史加最终响应构成，
+    因此窗口内的微压缩与提示改写都会体现在最终历史里，而不会把轨迹切碎。
+    """
+
     if not rounds:
         return []
     segments: list[list[RoundRecord]] = [[rounds[0]]]
     for current in rounds[1:]:
-        if context_continues(segments[-1][-1], current):
-            segments[-1].append(current)
-        else:
+        if is_compaction_restart(segments[-1][-1], current):
             segments.append([current])
+        else:
+            segments[-1].append(current)
     return segments
 
 
@@ -448,6 +529,37 @@ def text_from_blocks(value: Any, description: str) -> str:
             raise ValueError(f"{description}[{index}].text 必须是字符串")
         parts.append(text)
     return "".join(parts)
+
+
+def contains_image_block(value: Any) -> bool:
+    """递归判断 content/system 中是否出现 image block（用户粘贴截图等）。"""
+
+    if isinstance(value, dict):
+        if value.get("type") == "image":
+            return True
+        return any(contains_image_block(item) for item in value.values())
+    if isinstance(value, list):
+        return any(contains_image_block(item) for item in value)
+    return False
+
+
+def segment_contains_image(segment: list[RoundRecord]) -> bool:
+    """判断一个上下文窗口段的代表性请求/响应是否含 image block。
+
+    段由最后一轮的完整请求历史代表（split_rounds_by_context 的语义），因此
+    只需检查最后一轮的 system、messages 和响应 content。
+    """
+
+    last_round = segment[-1]
+    request = last_round.request_body
+    return any(
+        contains_image_block(value)
+        for value in (
+            request.get("system"),
+            request.get("messages"),
+            last_round.response_message.get("content"),
+        )
+    )
 
 
 def convert_assistant_content(
@@ -624,6 +736,16 @@ def convert_history_messages(
                     f"request.messages[{index}].content",
                 )
             )
+        elif role == "system":
+            # 嵌入式 system：按原相对位置独立保留为一条 system 消息，不合并进
+            # 首条 system，不删除、不跳过。文本仍走 system_text 的既有清理口径
+            # （billing header / <total_tokens>），与顶层 system 保持一致。
+            result.append(
+                {
+                    "role": "system",
+                    "content": system_text(content),
+                }
+            )
         else:
             raise ValueError(f"request.messages[{index}].role 不支持: {role!r}")
     return result, tool_names_by_id
@@ -635,7 +757,7 @@ def system_text(system: Any) -> str:
     if system is None:
         return ""
     if isinstance(system, str):
-        return "" if system.lstrip().startswith(BILLING_HEADER_PREFIX) else system
+        return clean_system_text(system)
     blocks = require_list(system, "request.system")
     parts: list[str] = []
     for index, block in enumerate(blocks):
@@ -645,9 +767,9 @@ def system_text(system: Any) -> str:
         text = block.get("text")
         if not isinstance(text, str):
             raise ValueError(f"request.system[{index}].text 必须是字符串")
-        if text.lstrip().startswith(BILLING_HEADER_PREFIX):
-            continue
-        parts.append(text)
+        cleaned = clean_system_text(text)
+        if cleaned:
+            parts.append(cleaned)
     return "\n".join(parts)
 
 

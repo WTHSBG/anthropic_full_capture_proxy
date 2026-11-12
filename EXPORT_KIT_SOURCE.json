@@ -1,0 +1,37 @@
+{
+  "archive": "sharegpt-export-kit(1).tar.gz",
+  "archive_sha256": "dfc5e4370663ecc939745fed811112feffaae6b3251d3102add6bcb9760ca972",
+  "upstream": "https://github.com/yida12345/anthropic_full_capture_proxy",
+  "upstream_commit": "b4e0874e5ebd5d605831e01dbe97446e52ec78e4",
+  "integration": "canonical-export 中的代码和指纹文件放到仓库根目录，代码文件保持与工具包逐字节一致；文档按本仓库布局更新。",
+  "files": {
+    "capture_core.py": {
+      "source": "canonical-export/capture_core.py",
+      "sha256": "511e0c022337801cde609a98d6a19e78a299b2bac884368b88be9246c1ba409f"
+    },
+    "export_sharegpt.py": {
+      "source": "canonical-export/export_sharegpt.py",
+      "sha256": "5fbe1d3783d0108b09e26a21043c66519c5cc0c86e2efa7d61917b03cc76c45a"
+    },
+    "export_sharegpt_recovered.py": {
+      "source": "canonical-export/export_sharegpt_recovered.py",
+      "sha256": "8abda3c79bae61346397c309cfc54d1a2fc2f406f6260c63671800581ace4d98"
+    },
+    "export_sharegpt_recovered_merged.py": {
+      "source": "canonical-export/export_sharegpt_recovered_merged.py",
+      "sha256": "299e4310be64f246b54c02f27a60ff902ff6b00350face9a58ebb890c2a2c82b"
+    },
+    "run_canonical_export.py": {
+      "source": "canonical-export/run_canonical_export.py",
+      "sha256": "79381af66c64c1e0e6a1b9bb6de7c97d70773cf37ddd36e34afb31a919649616"
+    },
+    "SHA256SUMS": {
+      "source": "canonical-export/SHA256SUMS",
+      "sha256": "39cc49a4402ba7cbf53984af26150f0cd446262dd3adf9d659838fcae6e4e616"
+    },
+    "finalize.py": {
+      "source": "finalize.py",
+      "sha256": "598a535cb9997722a696ba42ca853bfeb60eac549f4b2a1d7c860bdf02b9f34a"
+    }
+  }
+}

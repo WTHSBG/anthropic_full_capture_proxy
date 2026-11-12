@@ -72,7 +72,15 @@ sharegpt_output/run_20260803/
     └── subagent_<agent_id>_1.json
 ```
 
-同一个 agent 的相邻 round 在 model、实质 system 和消息历史连续时合并；billing cch、`cache_control`、thinking `signature` 以及字符串/单个 text block 的等价表示不会误触发切分。当新请求只增加工具、且已有工具定义未变时，仍属于同一上下文，最终文件使用 segment 最后一轮的工具全集。发生真正的上下文压缩、历史替换、system/model 变化、工具删除或已有工具定义改变时，从该 round 开始生成下一个文件。
+本分支沿用工具包的 CC 上下文窗口策略：只有消息数下降、且新历史首条消息包含
+`This session is being continued from a previous conversation` 时开启新段。
+model/system/tools 或其它历史变化不再单独切段。每段使用最后一轮的完整请求历史及响应生成样本，
+被该历史移除的早期内容不会单独导出。`context_continues` 仍用于恢复和接受证据检查，
+其诊断结果不再直接决定分段。
+
+system 文本清理 billing header 和 `<total_tokens>`；messages 中嵌入的 system 原位保留，
+不合并到首条 system，清理后可能保留为空内容的 system 消息。固定入口的指纹校验、
+图片前缀裁剪及 compact 合并行为见 [canonical 导出说明](README_canonical_export.md)。
 
 ## 工具调用兼容格式
 

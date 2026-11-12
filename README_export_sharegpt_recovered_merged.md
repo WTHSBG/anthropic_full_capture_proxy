@@ -47,7 +47,7 @@ python export_sharegpt_recovered_merged.py \
 | --- | --- |
 | 无正文、无工具调用的截断思考 | 删除该轮独立监督目标；此前有效历史保留 |
 | 截断思考出现在后续真实请求历史中 | 保留历史内容，将对应 assistant 标为 masked_assistant |
-| 有正文或合法工具调用，被后续请求完整回放 | 保留，按原有连续性规则与续写合并 |
+| 有正文或合法工具调用，被后续请求完整回放 | 保留，按本分支 CC 上下文窗口策略与续写合并 |
 | 有正文或工具调用，缺少后续接受证据 | 删除该轮监督目标，保留此前有效部分 |
 
 接受证据限于同 agent 的下一条有效请求，或同 session 的压缩请求；model、system、
@@ -86,3 +86,5 @@ assistant 事件。最终 API 错误为 `max_output_tokens`，或输入超长错
 输出来源和任务分类。`sharegpt_files` 是两组文件总数，两个 JSONL 的记录数分别报告。
 
 此脚本未接入 online/v2；在线流程的入口、缓存和增量发布将在后续单独处理。
+
+本分支已集成固定入口及配套 base。分段策略和图片裁剪见 [canonical 导出说明](README_canonical_export.md)；直接运行本脚本不会安装固定入口的图片裁剪逻辑。

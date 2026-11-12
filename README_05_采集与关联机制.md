@@ -46,13 +46,17 @@ Messages 请求识别兼容标准 `POST /v1/messages` 及网关添加前缀后�
 
 - HTTP 请求是 Messages 路径且状态完整
 - `x-claude-code-session-id` 与主 session 完全一致
-- 最后一条 user message 包含 Claude Code 专用 compact 指令
+- 从末尾跳过 system 消息后，最后一条 user message 包含 Claude Code 专用 compact 指令
 - 主 session 存在 `compact_boundary` 及其 `isCompactSummary` synthetic user message
 - HTTP 响应完成时间与边界相邻
 - 响应 `<summary>` 正文完整出现在 synthetic message 中
 - capture 与边界是一对一唯一匹配
 
 全部满足后，最终数据集中会创建 `subagent_acompact-recovered-<boundary_uuid>`；它不会修改或伪造源目录中的 `subagents/*.jsonl`。任何证据缺失、冲突或多义时仍进入 `unmatched`。恢复统计写入 `finalization_report.json.compact_recovery`。
+
+新式会话还支持 `compactMetadata.preservedSegment.anchorUuid` 指向摘要记录自身的 `uuid`，
+其 `parentUuid` 可以指向中间 attachment；旧式 parentUuid 直接对应边界 uuid 继续兼容。
+该行为来自工具包 finalize.py，仍要求 session、时间、摘要正文及一对一证据成立。
 
 ## 保证范围
 
