@@ -37,3 +37,24 @@ CC 对 Edit 的重放参数补了默认 replace_all=false，导出遵循该有�
 
 本次覆盖手动compact和CLI非交互恢复，不覆盖终端按键UI、自动compact、子agent或所有模型。
 真实日志和导出仅保存在测试者本地，不提交公开仓库。
+
+## 修复后独立新会话复测（2026-11-12）
+
+重新核对 npm latest/next 和[官方最新发布](https://github.com/anthropics/claude-code/releases/tag/v2.1.322)
+均为 2.1.322；临时安装的 CLI 版本及原生会话 version 字段均为 2.1.322。
+本次在已修复的 `6e869d4` 上创建全新会话，没有复用上一批请求或导出文件，也没有新增代码修改。
+
+同一新会话依次完成对话、Read→Write→Read、压缩前记忆检查、原生 `/compact`、
+压缩后无工具复述记忆、Read→Edit→Read。六个阶段全部成功，manual compact 计数为
+11228→3339，原生边界与摘要的 anchorUuid 关联正确。
+
+12条真实 HTTP 请求全部完整采集并直接关联，matched=12、unmatched=0、conflicts=0，
+compact 恢复1条。6次工具调用的ID、输入及结果内容均与真实HTTP记录核对；
+Edit 重放补默认 `replace_all=false` 有后续真实请求作为证据。
+
+固定入口导出3条轨迹：压缩前主会话、压缩后主会话、独立compact摘要。
+合并compact数为0，独立compact的5条历史assistant使用 `masked_assistant`，最后摘要为 `assistant`。
+原始记录处理前后哈希不变，未检出明文凭据。临时安装已清理，用户全局CLI和配置保持不变，
+测试代理已停止。完整原始证据、验收报告、轨迹及逐条说明另存于本地，未提交公开仓库。
+
+复测覆盖范围仍为手动compact和CLI恢复，不覆盖自动compact、终端按键UI、子agent或所有模型。
