@@ -76,7 +76,7 @@ export_sharegpt.py / export_sharegpt_recovered.py
 python -m unittest discover -s tests -v
 ```
 
-180 项自动化测试覆盖原有 Claude Code 路径、新客户端关联/导出、compact、采集故障、
+167 项自动化测试覆盖原有 Claude Code 路径、新客户端关联/导出、compact、采集故障、
 自动归档及上游新增的负载均衡、缓存重试与合并导出。各独立入口的支持边界见上表。
 真实 Kimi/Hermes 文件工具及原生压缩已另行验收；受测版本和范围见
 [验收说明](tests/ACCEPTANCE.md)。文本、可见 reasoning 和 function 工具可导出；
@@ -85,7 +85,3 @@ python -m unittest discover -s tests -v
 压缩样本需保留原有历史 assistant mask 规则时，使用 `export_sharegpt_recovered.py`：最后一条摘要仍为 assistant，
 此前 assistant 标为 masked_assistant；具体训练字段与规则见
 [导出说明](README_04_导出_ShareGPT.md#kimi--hermes-与压缩轨迹)。
-
-CC compact 关联同时兼容旧式 parentUuid 和新式 preservedSegment.anchorUuid；
-离线导出识别 system 中的 total_tokens 运行时注入。格式与证据边界见
-[关联机制](README_05_采集与关联机制.md)和[导出说明](README_04_导出_ShareGPT.md)。

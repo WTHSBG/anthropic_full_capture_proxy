@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from capture_core import write_json
-from api_protocols import clean_cc_system_content, clean_cc_system_text, normalize_cc_request, normalize_round
+from api_protocols import normalize_round
 
 
 ROUND_DIRECTORY_PATTERN = re.compile(r"^round_(\d+)$")
@@ -233,9 +233,8 @@ def normalized_message_for_context(message: Any) -> Any:
 
 
 def normalized_system(system: Any) -> Any:
-    """删除 billing header 和 total_tokens 运行时统计，再进行语义规范化。"""
+    """删除每轮 cch 都会变化的内部 billing header，再进行语义规范化。"""
 
-    system = clean_cc_system_content(system)
     if isinstance(system, str):
         return (
             []
@@ -644,7 +643,7 @@ def system_text(system: Any) -> str:
     if system is None:
         return ""
     if isinstance(system, str):
-        return clean_cc_system_text(system)
+        return "" if system.lstrip().startswith(BILLING_HEADER_PREFIX) else system
     blocks = require_list(system, "request.system")
     parts: list[str] = []
     for index, block in enumerate(blocks):
@@ -654,10 +653,9 @@ def system_text(system: Any) -> str:
         text = block.get("text")
         if not isinstance(text, str):
             raise ValueError(f"request.system[{index}].text 必须是字符串")
-        cleaned = clean_cc_system_text(text)
-        if not cleaned and cleaned != text:
+        if text.lstrip().startswith(BILLING_HEADER_PREFIX):
             continue
-        parts.append(cleaned)
+        parts.append(text)
     return "\n".join(parts)
 
 
@@ -672,7 +670,7 @@ def build_sharegpt_record(
     if not segment:
         raise ValueError("不能从空 segment 构建 ShareGPT")
     last_round = segment[-1]
-    request = normalize_cc_request(last_round.request_body)
+    request = last_round.request_body
 
     messages: list[dict[str, Any]] = []
     converted_system = system_text(request.get("system"))
